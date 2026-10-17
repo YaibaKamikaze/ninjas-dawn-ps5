@@ -1,4 +1,7 @@
 # Ninja's Dawn for PS5 (alpha)
+<img width="512" height="512" alt="icon0" src="https://github.com/user-attachments/assets/013fdf97-cb38-47ed-a035-aa53e4dd2761" />
+
+
 
 A homebrew port of **Ninja's Dawn**, the static recompilation of **Ninja Gaiden II**
 (Xbox 360), to the **PlayStation 5**. The game's PowerPC code is translated ahead
