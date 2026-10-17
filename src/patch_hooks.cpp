@@ -9,6 +9,12 @@
 // Off by default: it is a hack on the game's own render setup, and 1120x584 is
 // what the title shipped with. When it is off these hooks cost one comparison.
 
+#if defined(__PROSPERO__)
+// [ps5 port] The POSIX names of the case-insensitive compares.
+#include <strings.h>
+#define _stricmp strcasecmp
+#define _strnicmp strncasecmp
+#endif
 #include <rex/cvar.h>
 #include <rex/hook.h>
 #include <rex/logging.h>
@@ -239,7 +245,7 @@ void ng2PatchSkipVideos(PPCRegister& r28) {
   // Bounded: this is a guest pointer on a hot path, and a missing NUL must not
   // walk the whole address space.
   size_t len = 0;
-  while (len < 260 && path[len] != ' ')
+  while (len < 260 && path[len] != '\0')  // [ps5 port] the mirror had lost this escape
     ++len;
   if (len < 4)
     return;
@@ -249,7 +255,10 @@ void ng2PatchSkipVideos(PPCRegister& r28) {
   const std::string name(path, len);
 
   // Skip the openings and the attract demos, never a chapter-loading video.
-  const auto slash = name.find_last_of("\/:");
+  // [ps5 port] The mirror this source came from had lost the backslash here,
+  // so guest paths (game:\video\...) were never split and the name check
+  // below never matched.
+  const auto slash = name.find_last_of("\\/:");
   const std::string base = slash == std::string::npos ? name : name.substr(slash + 1);
   if (_strnicmp(base.c_str(), "aurora", 6) == 0)
     return;

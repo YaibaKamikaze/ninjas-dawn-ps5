@@ -22,6 +22,20 @@
 #include "ng2_settings.h"
 #include "ng2_tuning.h"
 #include "ng2_update.h"
+#if defined(__PROSPERO__)
+// [ps5 port] The hub (in place of the PC setup screen), the in-game overlay
+// (the F10 menu for the DualSense), the app folder's layout, and the texture
+// hook behind the dump and the PlayStation button pictures.
+#include "ps5/hub/hub_ui.h"
+#include "ps5/hub/ps5_hub.h"
+#include "ps5/overlay/ps5_overlay.h"
+#include "ps5/ps5_button_prompts.h"
+#include "ps5/ps5_paths.h"
+#include "ps5/ps5_textures.h"
+#ifndef NG2_PS5_VERSION
+#define NG2_PS5_VERSION "dev"
+#endif
+#endif
 #include <rex/system/flags.h>
 #include <rex/system/xam/content_manager.h>
 #include <rex/system/xmemory.h>
@@ -100,6 +114,20 @@ class Ng2App : public rex::ReXApp {
   void OnConfigurePaths(rex::PathConfig& paths) override {
     settings_.Load();
     ApplyEnvironmentOverrides();
+#if defined(__PROSPERO__)
+    // [ps5 port] The app folder's own folders, the PS5's first-run values
+    // over the PC defaults (once), and the shader storage in UserData so it
+    // survives updates of the app and is never shipped (docs/PS5_PORT.md 5.8).
+    ng2ps5::paths::EnsureFolders();
+    if (settings_.ps5_defaults_version < ng2ps5::hub::kPs5DefaultsVersion) {
+      ng2ps5::hub::UpdatePs5Defaults(settings_);
+      settings_.Save();
+    }
+    // The aspect ratio is always kept on the PS5 (the hub has no toggle for
+    // it any more), whatever an older settings file says.
+    settings_.letterbox = true;
+    rex::cvar::SetFlagByName("cache_root", (ng2ps5::paths::Cache() / "shaders").string());
+#endif
 
     // First run on this machine: size the memory settings from the hardware
     // rather than shipping one number and hoping. Here, not later, because both
@@ -146,6 +174,13 @@ class Ng2App : public rex::ReXApp {
   // had already filled in before this hook ran, so this survives the SDK
   // changing its mind about where the default should be.
   void UsePortableUserData(rex::PathConfig& paths) {
+#if defined(__PROSPERO__)
+    // [ps5 port] Always the app's UserData folder (ps5_paths.h); there is no
+    // older location to bring anything across from.
+    paths.user_data_root = ng2ps5::paths::UserData();
+    paths.cache_root = ng2ps5::paths::Cache() / "shaders";
+    return;
+#endif
     const auto local = rex::filesystem::GetExecutableFolder() / "user";
     const auto previous = paths.user_data_root;
     if (previous == local)
@@ -179,6 +214,11 @@ class Ng2App : public rex::ReXApp {
   std::optional<rex::PathConfig> OnFinalizePaths(
       const rex::PathConfig& defaults,
       std::function<void(rex::PathConfig)> resume) override {
+#if defined(__PROSPERO__)
+    // [ps5 port] The hub, every launch: it is the app's front screen, not a
+    // first-run setup, and OPTIONS on it starts the game at once.
+    return ShowPs5Hub(defaults, std::move(resume));
+#endif
     const bool path_from_cli = !REXCVAR_GET(game_data_root).empty();
 
     // Remember a game folder given on the command line, so a later launch with
@@ -251,6 +291,92 @@ class Ng2App : public rex::ReXApp {
     return std::nullopt;
   }
 
+#if defined(__PROSPERO__)
+  // [ps5 port] The hub in place of the setup screen.
+  //
+  // This hook runs after OnPreSetup has applied the display settings and the
+  // tuning file, but before the runtime - and with it the GPU - is built. So
+  // everything the hub changed is applied again on START GAME, and settings
+  // the GPU reads once at start-up (the resolution scale, the render target
+  // path, the texture cache, the shader mode) take effect without a relaunch.
+  std::optional<rex::PathConfig> ShowPs5Hub(const rex::PathConfig& defaults,
+                                            std::function<void(rex::PathConfig)> resume) {
+    StartUiPump();
+    ng2ps5::hub::ShowOptions options;
+    options.settings = &settings_;
+    options.version = std::string(NG2_PS5_VERSION) + "  (Ninja's Dawn " NG2_VERSION ")";
+    options.write_diagnostics = [] {
+      const auto result = ng2::WriteDiagnostics(Ng2Settings::Path(), ng2ps5::paths::Logs());
+      return result.ok ? "Written to logs/" + result.file.filename().string()
+                       : "Could not write diagnostics: " + result.error;
+    };
+    options.start = [this, defaults, resume](std::vector<std::filesystem::path> imports) {
+      app_context().CallInUIThreadDeferred([this, defaults, resume, imports] {
+        StopUiPump();
+        settings_.Clamp();
+        settings_.Save();
+        if (!imports.empty())
+          ng2::QueueSaveImports(imports);
+        ApplyDisplaySettings();
+        ApplyTuning();
+        ng2::ApplyLiveSettings(settings_, window());
+        rex::PathConfig paths = defaults;
+        paths.game_data_root = settings_.ResolvedGamePath();
+        resume(paths);
+      });
+    };
+    options.quit = [this] {
+      app_context().CallInUIThreadDeferred([this] {
+        StopUiPump();
+        settings_.Save();
+        std::fflush(nullptr);
+        rex::FlushLogging();
+        ng2::ExitNow(0);
+      });
+    };
+    // NG2_AUTOSTART: straight past the hub, for unattended test runs (the
+    // host test build; on a console nothing sets it).
+    if (const char* autostart = std::getenv("NG2_AUTOSTART"); autostart && *autostart) {
+      REXLOG_INFO("PS5 hub: NG2_AUTOSTART - starting the game without the hub");
+      options.start({});
+      return std::nullopt;
+    }
+    ng2ps5::hub::Show(imgui_drawer(), std::move(options));
+    return std::nullopt;
+  }
+
+  // [ps5 port] What the guest is told and how far it is scaled, from the
+  // hub's resolution preset (docs/PS5_PORT.md 5.7). The guest is told the Xbox
+  // 360's own 1280x720 HD mode - the frame the game is built for - and the
+  // GPU renders it at an exact 3x, 2x or 1x; the presenter takes that to the
+  // console's video output, bars and all if Keep aspect ratio is on.
+  void ApplyPs5Display() {
+    static constexpr int kPresetScale[] = {3, 2, 1};
+    settings_.resolution_scale = settings_.ps5_render_scale > 0
+                                     ? settings_.ps5_render_scale
+                                     : kPresetScale[std::clamp(settings_.ps5_resolution, 0, 2)];
+    REXCVAR_SET(video_mode_width, 1280);
+    REXCVAR_SET(video_mode_height, 720);
+    if (rex::cvar::GetFlagInfo("video_mode_explicit"))
+      rex::cvar::SetFlagByName("video_mode_explicit", "true");
+    REXCVAR_SET(video_mode_refresh_rate, double(settings_.fps));
+    if (settings_.internal_720p) {
+      REXCVAR_SET(ng2_render_width, 1280);
+      REXCVAR_SET(ng2_render_height, 720);
+    } else {
+      REXCVAR_SET(ng2_render_width, 0);
+      REXCVAR_SET(ng2_render_height, 0);
+    }
+    REXCVAR_SET(ng2_video_mode, settings_.video_mode);
+    const int base_w = settings_.internal_720p ? 1280 : 1120;
+    const int base_h = settings_.internal_720p ? 720 : 584;
+    REXLOG_INFO("Display (PS5): preset {}, renders {}x{} ({}x of {}x{}), {} Hz, keep aspect {}",
+                settings_.ps5_resolution, base_w * settings_.resolution_scale,
+                base_h * settings_.resolution_scale, settings_.resolution_scale, base_w, base_h,
+                settings_.fps, settings_.letterbox);
+  }
+#endif
+
   // F10 opens the same settings over the running game. F4 (the SDK's own raw
   // cvar browser) is left alone; this menu links to it rather than replacing
   // it, because the two answer different questions.
@@ -285,6 +411,33 @@ class Ng2App : public rex::ReXApp {
     ng2::SetHudSettings(&settings_);
     ng2::StartPerfMonitor();
     perf_hud_ = std::make_unique<ng2::PerfHudOverlay>(drawer);
+
+#if defined(__PROSPERO__)
+    // [ps5 port] The in-game overlay. Created now, enabled in OnPostSetup:
+    // the hub has the controller until the game starts.
+    {
+      ng2ps5::overlay::Callbacks callbacks;
+      callbacks.apply_live = [this] {
+        ng2::ApplyLiveSettings(settings_, window());
+        ng2::SetAutoSkipEnabled(settings_.skip_cinematics);
+        rex::cvar::SetFlagByName("guest_vblank_display_locked",
+                                 settings_.ps5_display_locked_vblank ? "true" : "false");
+        rex::cvar::SetFlagByName("gpu_phase_timer_details", settings_.ps5_gpu_timer_details ? "true" : "false");
+      };
+      callbacks.return_to_hub = [this] {
+        app_context().CallInUIThreadDeferred([this] { ReturnToMenu(); });
+      };
+      callbacks.quit_home = [this] {
+        app_context().CallInUIThreadDeferred([this] {
+          ShutdownCleanlyForRelaunch();
+          std::fflush(nullptr);
+          rex::FlushLogging();
+          ng2::ExitNow(0);
+        });
+      };
+      ps5_overlay_ = std::make_unique<ng2ps5::overlay::Overlay>(drawer, &settings_, std::move(callbacks));
+    }
+#endif
 
     // Escape quits. The window's close button already does, but a full-screen
     // game with no visible chrome needs a key that gets you out.
@@ -368,7 +521,12 @@ class Ng2App : public rex::ReXApp {
   // The menu's own font and theme. OnConfigureFonts runs while the ImGui atlas
   // is still open; OnConfigureStyle right after the SDK has applied its own
   // defaults, so this is a replacement rather than a patch.
-  void OnConfigureFonts(ImFontAtlas* atlas) override { ng2::LoadMenuFonts(atlas); }
+  void OnConfigureFonts(ImFontAtlas* atlas) override {
+#if defined(__PROSPERO__)
+    ng2ps5::hub::ConfigureFonts(atlas);  // [ps5 port] built into the app
+#endif
+    ng2::LoadMenuFonts(atlas);
+  }
 
   void OnConfigureStyle(ImGuiStyle& imgui_style, rex::ui::Style& ui_style) override {
     ng2::ApplyMenuStyle(imgui_style);
@@ -458,7 +616,7 @@ class Ng2App : public rex::ReXApp {
       REXLOG_WARN("Shutdown: the runtime did not finish in 3 s; exiting now");
       std::fflush(nullptr);
       rex::FlushLogging();
-      std::_Exit(0);
+      ng2::ExitNow(0);  // [ps5 port] _Exit, or the PS5 shell's close
     }).detach();
   }
 
@@ -560,8 +718,13 @@ class Ng2App : public rex::ReXApp {
     if (shutting_down_)
       return;
     ShutdownCleanlyForRelaunch();
+#if defined(__PROSPERO__)
+    // [ps5 port] The app reloaded by the system, back into its hub.
+    const std::filesystem::path exe = "/app0/eboot.bin";
+#else
     const std::filesystem::path exe =
         rex::filesystem::GetExecutableFolder() / "ng2.exe";
+#endif
     std::error_code ec;
     if (std::filesystem::exists(exe, ec)) {
       ng2::LaunchDetached(exe, "--ng2_setup");
@@ -570,7 +733,7 @@ class Ng2App : public rex::ReXApp {
     }
     std::fflush(nullptr);
     rex::FlushLogging();
-    std::_Exit(0);
+    ng2::ExitNow(0);  // [ps5 port] _Exit, or the PS5 shell's close
   }
 
   // ShutdownCleanly without the exit watchdog: the caller exits by itself and
@@ -599,7 +762,7 @@ class Ng2App : public rex::ReXApp {
     REXLOG_INFO("Update: exiting so the installer can replace the files");
     std::fflush(nullptr);
     rex::FlushLogging();
-    std::_Exit(0);
+    ng2::ExitNow(0);  // [ps5 port] _Exit, or the PS5 shell's close
   }
 
   // Called when the window's close button is pressed, before the SDK's own
@@ -621,6 +784,9 @@ class Ng2App : public rex::ReXApp {
     setup_screen_.reset();
     overlay_.reset();
     advanced_.reset();
+#if defined(__PROSPERO__)
+    ps5_overlay_.reset();  // [ps5 port]
+#endif
     tex_notify_.reset();
     warm_overlay_.reset();
     update_overlay_.reset();
@@ -771,6 +937,10 @@ class Ng2App : public rex::ReXApp {
   }
 
   void ApplyDisplaySettings() {
+#if defined(__PROSPERO__)
+    ApplyPs5Display();  // [ps5 port] no window to fit: the resolution presets
+    return;
+#endif
     // The guest is told a 16:9 display, whatever shape the window is.
     //
     // It used to be told the window size. Ninja Gaiden II renders 16:9 (the
@@ -893,7 +1063,12 @@ class Ng2App : public rex::ReXApp {
     if (!std::filesystem::is_regular_file(path, ec)) return false;
     if (std::filesystem::file_size(path, ec) < 0x1000) return false;
     FILE* f = nullptr;
+#if defined(__PROSPERO__)
+    f = std::fopen(path.c_str(), "rb");  // [ps5 port] narrow paths
+    if (!f) return false;
+#else
     if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || !f) return false;
+#endif
     char magic[4] = {};
     const size_t got = std::fread(magic, 1, sizeof(magic), f);
     std::fclose(f);
@@ -1001,6 +1176,11 @@ class Ng2App : public rex::ReXApp {
       // would replace something informative with something less so.
       if (ng2::GetWarmState().warming)
         return false;
+#if defined(__PROSPERO__)
+      // [ps5 port] The game is held while the overlay is open.
+      if (ng2ps5::overlay::Overlay::IsOpen())
+        return false;
+#endif
       return ng2::ThisProcessIsForeground();
     });
     REXLOG_INFO("Input: held while the texture cache warms, and while we are "
@@ -1055,6 +1235,17 @@ class Ng2App : public rex::ReXApp {
   // had been set on the command line. It is why internal scaling was written
   // off as impossible.
   void ApplyTuning() {
+#if defined(__PROSPERO__)
+    // [ps5 port] Derived every launch, so with the cache rather than beside
+    // the (read-mostly) package files.
+    {
+      auto entries = Ng2Tuning::Fixed();
+      for (auto& e : Ng2Tuning::FromSettings(settings_, std::string()))
+        entries.push_back(std::move(e));
+      Ng2Tuning::Apply(ng2ps5::paths::Cache() / "ng2_tuning.toml", entries);
+      return;
+    }
+#endif
     auto entries = Ng2Tuning::Fixed();
     const auto mappings =
         rex::filesystem::GetExecutableFolder() / "gamecontrollerdb.txt";
@@ -1144,6 +1335,24 @@ class Ng2App : public rex::ReXApp {
   void OnPostSetup() override {
     MaybeWriteDiagnostics();
     ArmQuitSeam();
+#if defined(__PROSPERO__)
+    // [ps5 port] The texture hook: the PlayStation button pictures and the
+    // dump. Before LaunchModule, so the first texture the game loads goes
+    // through it. Then the overlay gets the controller.
+    {
+      ng2ps5::prompts::Init(ng2ps5::paths::App());
+      ng2ps5::textures::Config tc;
+      tc.dump = settings_.texture_dump;
+      tc.dump_dir = ng2ps5::paths::TexturePacks() / "PS5 Dump" / "dump";
+      tc.prompts = settings_.ps5_playstation_prompts;
+      tc.dump_hud_pictures = settings_.ps5_dump_hud_pictures;
+      ng2ps5::textures::Configure(tc);
+      if (settings_.texture_pack)
+        REXLOG_WARN("Texture pack: loading packs is not in this PS5 build; the game's own textures are used");
+      if (ps5_overlay_)
+        ps5_overlay_->SetEnabled(true);
+    }
+#endif
 
     // Apply the saved ultrawide / FOV now that the GPU plugin (which owns the
     // ng2_fov_k cvar) is loaded and its cvars are registered.
@@ -1207,7 +1416,11 @@ class Ng2App : public rex::ReXApp {
                 "clear_memory_page_state={}",
                 rex::cvar::GetFlagByName("draw_resolution_scale_x"),
                 rex::cvar::GetFlagByName("draw_resolution_scale_y"),
+#if defined(__PROSPERO__)
+                rex::cvar::GetFlagByName("render_target_path_vulkan"),  // [ps5 port]
+#else
                 rex::cvar::GetFlagByName("render_target_path_d3d12"),
+#endif
                 rex::cvar::GetFlagByName("clear_memory_page_state"));
     // The window exists by now, so the comfort settings can go straight on it.
     if (auto* w = window()) {
@@ -1282,7 +1495,7 @@ class Ng2App : public rex::ReXApp {
       return;
     }
     memory->Zero(kBase, kSize);
-    static constexpr char kPath[] = "game:\__video_skipped__.wmv";
+    static constexpr char kPath[] = "game:\\__video_skipped__.wmv";  // [ps5 port] the mirror lost the backslash
     auto* dest = memory->TranslateVirtual<char*>(kBase);
     if (dest == nullptr)
       return;
@@ -1350,6 +1563,9 @@ class Ng2App : public rex::ReXApp {
   std::unique_ptr<ng2::WarmOverlay> warm_overlay_;
   std::unique_ptr<ng2::update::UpdateOverlay> update_overlay_;
   std::unique_ptr<ng2::PerfHudOverlay> perf_hud_;
+#if defined(__PROSPERO__)
+  std::unique_ptr<ng2ps5::overlay::Overlay> ps5_overlay_;  // [ps5 port]
+#endif
 
   // What the first-run hardware detection saw, reported once logging exists.
   ng2::GpuInfo detect_gpu_;

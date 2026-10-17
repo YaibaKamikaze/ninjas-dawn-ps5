@@ -1,6 +1,12 @@
 #include "ng2_autoskip.h"
 
+#if !defined(__PROSPERO__)
 #include <windows.h>
+#else
+#include <mutex>
+#include <unistd.h>  // [ps5 port] getpid
+#include "ps5/ps5_pad.h"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -152,6 +158,15 @@ uint16_t ScriptButtons(double now) {
 // version present differs across Windows installs and a missing DLL should cost
 // the feature, not the process.
 bool RealPadActive() {
+#if defined(__PROSPERO__)
+  // [ps5 port] The DualSense through scePad, the same way: the synthetic pad
+  // is not an scePad device, so this sees only the player's hands. Any button
+  // or the left stick past half counts as touching it.
+  static std::mutex mutex;
+  static ng2ps5::Pad pad;
+  std::lock_guard lock(mutex);
+  return pad.Read().held != 0;
+#else
   struct XInputGamepad {
     uint16_t buttons; uint8_t lt, rt; int16_t lx, ly, rx, ry;
   };
@@ -181,6 +196,7 @@ bool RealPadActive() {
     }
   }
   return false;
+#endif
 }
 
 // --- Live pad file (pad_script.txt) ------------------------------------------
@@ -279,6 +295,9 @@ bool ParsePadLine(const std::string& raw, PadCmd& out, bool& clear) {
 }
 
 void PollPadFile() {
+#if defined(__PROSPERO__)
+  return;  // [ps5 port] the live pad file is a PC test tool (AI Vision's padscript)
+#endif
   const double now = Now();
   if (now - g_padfile_last_poll < 0.1)
     return;
@@ -357,6 +376,9 @@ void ClearPadFileQueue() {
 }
 
 void WritePadAcceptsOnce() {
+#if defined(__PROSPERO__)
+  return;  // [ps5 port] the live pad file is a PC test tool (AI Vision's padscript)
+#endif
   if (g_padfile_accepts_written)
     return;
   g_padfile_accepts_written = true;
@@ -364,7 +386,11 @@ void WritePadAcceptsOnce() {
   const auto path = PadDir() / "pad_script.accepts";
   std::ofstream f(path, std::ios::trunc);
   if (f) {
+#if defined(__PROSPERO__)
+    f << "ng2recomp pad script v1 pid=" << getpid() << "\n";  // [ps5 port]
+#else
     f << "ng2recomp pad script v1 pid=" << GetCurrentProcessId() << "\n";
+#endif
     f.close();
     REXLOG_INFO("Pad file: live channel ready ({})", path.string());
   }

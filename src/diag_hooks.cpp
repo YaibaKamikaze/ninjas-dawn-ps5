@@ -10,14 +10,30 @@
 #include <thread>
 #include <vector>
 
+#if !defined(__PROSPERO__)
 #include <windows.h>
-#include <cmath>
 #include <tlhelp32.h>
+#endif
+#include <cmath>
 #include <algorithm>
 #include <unordered_map>
 #include <atomic>
 #include <chrono>
 #include <array>
+
+#if defined(__PROSPERO__)
+// [ps5 port] The two Windows timing calls the hooks below use, from the
+// standard library. GetTickCount64 counts milliseconds from an arbitrary start,
+// which is all its callers rely on (they subtract a first reading).
+namespace {
+inline void Sleep(unsigned ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
+inline uint64_t GetTickCount64() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+}
+}  // namespace
+#endif
 
 #include "ng2_autoskip.h"
 #include "ng2_chapter.h"
@@ -111,6 +127,20 @@ int g_switch_distinct = 0;
 // The generated dispatch externs these with C++ linkage, so no extern "C".
 
 
+#if defined(__PROSPERO__)
+// [ps5 port] The investigation tools from here to the end of the block - the
+// windowed guest profiler, the hardware-watchpoint write trap, the oscillation
+// scan and the projection-matrix finder - suspend threads, set debug
+// registers and walk the address space through Win32. They found bugs on the
+// PC and are not needed to run the game, so on the PS5 they are not built and
+// their entry points do nothing.
+namespace ng2 {
+void StartGuestProfiler() {}
+void ScanOscillating() {}
+void FindProjection() {}
+void StartOscillationLoop() {}
+}  // namespace ng2
+#else
 // [diag] Windowed guest profiler for the ledge jump-loop and the black screen
 // on "Quit Game". Reports the hottest guest functions per 5-second window;
 // windowed rather than cumulative, because a cumulative histogram is dominated
@@ -757,6 +787,7 @@ void StartOscillationLoop() {
     std::thread(OscillationLoop).detach();
 }
 }  // namespace ng2
+#endif  // __PROSPERO__
 
 void ng2DiagEnterSub83844348(PPCRegister& r3) {
   ++g_enter_count;
@@ -943,6 +974,11 @@ void MaybeTriggerRenderDocCapture(int frame) {
     return;
   fired = true;
 
+#if defined(__PROSPERO__)
+  // [ps5 port] No RenderDoc on the console.
+  REXLOG_WARN("[diag] REX_NG2_RDOC_AT_MS is set, but RenderDoc is not available on the PS5");
+  (void)frame;
+#else
   static RENDERDOC_API_1_1_2* api = [] () -> RENDERDOC_API_1_1_2* {
     HMODULE mod = GetModuleHandleA("renderdoc.dll");
     if (!mod) {
@@ -965,6 +1001,7 @@ void MaybeTriggerRenderDocCapture(int frame) {
     return;
   api->TriggerCapture();
   REXLOG_INFO("[diag] RenderDoc capture triggered at frame {}", frame);
+#endif
 }
 
 // Dump an arbitrary physical guest range once, at a chosen moment.

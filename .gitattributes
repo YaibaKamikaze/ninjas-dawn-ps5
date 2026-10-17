@@ -1,0 +1,7 @@
+# [ps5 port] Scripts and patches run on Linux: always LF.
+*.sh text eol=lf
+*.py text eol=lf
+*.patch text eol=lf
+ps5/** text eol=lf
+ps5/**/*.dds binary
+ps5/**/*.png binary

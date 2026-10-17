@@ -1,16 +1,127 @@
 #include "ng2_platform.h"
 
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <iterator>
+
+#include <rex/logging.h>
+
+namespace ng2 {
+
+std::string FormatBytes(uint64_t bytes) {
+  const char* units[] = {"B", "KB", "MB", "GB", "TB"};
+  double value = static_cast<double>(bytes);
+  size_t unit = 0;
+  while (value >= 1024.0 && unit + 1 < std::size(units)) {
+    value /= 1024.0;
+    ++unit;
+  }
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), unit == 0 ? "%.0f %s" : "%.1f %s", value, units[unit]);
+  return buf;
+}
+
+}  // namespace ng2
+
+#if defined(__PROSPERO__)
+// [ps5 port] The PS5 has one fullscreen display, no pointer, no keyboard and
+// no file dialogs: the app's folders are fixed (Game Data/, DLC/, ...), so the
+// pickers report a cancel and the display is the console's video output.
+
+#include <unistd.h>
+
+extern "C" int sceSystemServiceLoadExec(const char* path, char* const argv[]);
+
+namespace ng2 {
+namespace {
+
+// The console's output as the runtime presents it. Ninja Gaiden II's 16:9
+// frame is all a TV shows, so only the aspect of this matters (the ultrawide
+// field-of-view code reads it).
+constexpr int kDisplayWidth = 3840;
+constexpr int kDisplayHeight = 2160;
+
+}  // namespace
+
+std::optional<std::filesystem::path> PickFile(const std::string&,
+                                              const std::vector<FileFilter>&,
+                                              const std::filesystem::path&) {
+  return std::nullopt;
+}
+
+std::optional<std::filesystem::path> PickFolder(const std::string&,
+                                                const std::filesystem::path&) {
+  return std::nullopt;
+}
+
+bool ShiftHeld() { return false; }
+
+bool ThisProcessIsForeground() { return true; }
+
+std::vector<MonitorInfo> Monitors() {
+  MonitorInfo m;
+  m.full_width = m.width = kDisplayWidth;
+  m.full_height = m.height = kDisplayHeight;
+  m.primary = true;
+  return {m};
+}
+
+float SystemScale() { return 1.0f; }
+
+bool MonitorWorkArea(int, int& width, int& height, float& scale) {
+  width = kDisplayWidth;
+  height = kDisplayHeight;
+  scale = 1.0f;
+  return true;
+}
+
+bool MonitorFullSize(int, int& width, int& height) {
+  width = kDisplayWidth;
+  height = kDisplayHeight;
+  return true;
+}
+
+bool LaunchDetached(const std::filesystem::path& exe, const std::string& args) {
+  // The PS5 runs one copy of a title: "another copy" is this app reloaded by
+  // the system, which ends this process. Arguments are split on spaces, which
+  // is all the callers pass.
+  std::vector<std::string> words;
+  for (size_t at = 0; at < args.size();) {
+    const size_t end = std::min(args.find(' ', at), args.size());
+    if (end > at) words.push_back(args.substr(at, end - at));
+    at = end + 1;
+  }
+  std::vector<char*> argv;
+  for (auto& w : words) argv.push_back(w.data());
+  argv.push_back(nullptr);
+  rex::FlushLogging();
+  const std::string path = exe.empty() ? std::string("/app0/eboot.bin") : exe.string();
+  const int rc = sceSystemServiceLoadExec(path.c_str(), argv.data());
+  REXLOG_ERROR("Relaunch of {} failed ({:#x})", path, uint32_t(rc));
+  return false;
+}
+
+void ExitNow(int code) {
+  REXLOG_INFO("Asking the system to close the app (status {})", code);
+  std::fflush(nullptr);
+  rex::FlushLogging();
+  sceSystemServiceLoadExec("exit", nullptr);
+  // The shell closes the title asynchronously: wait for it, never return.
+  for (;;) usleep(100000);
+}
+
+}  // namespace ng2
+
+#else  // Windows
+
 #include <windows.h>
 
-#include <algorithm>
 // windows.h first, then the shell headers.
 #include <shlobj.h>
 #include <shobjidl.h>
 
-#include <cstdio>
 #include <cwchar>
-
-#include <rex/logging.h>
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "shell32.lib")
@@ -161,18 +272,7 @@ bool LaunchDetached(const std::filesystem::path& exe, const std::string& args) {
   return true;
 }
 
-std::string FormatBytes(uint64_t bytes) {
-  const char* units[] = {"B", "KB", "MB", "GB", "TB"};
-  double value = static_cast<double>(bytes);
-  size_t unit = 0;
-  while (value >= 1024.0 && unit + 1 < std::size(units)) {
-    value /= 1024.0;
-    ++unit;
-  }
-  char buf[64];
-  std::snprintf(buf, sizeof(buf), unit == 0 ? "%.0f %s" : "%.1f %s", value, units[unit]);
-  return buf;
-}
+void ExitNow(int code) { std::_Exit(code); }
 
 namespace {
 
@@ -281,3 +381,5 @@ bool MonitorFullSize(int index, int& width, int& height) {
 }
 
 }  // namespace ng2
+
+#endif  // __PROSPERO__

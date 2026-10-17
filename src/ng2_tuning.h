@@ -64,14 +64,18 @@ struct Ng2Tuning {
         {"protect_zero", "false",
          "[compat] requires_protect_zero_false - the game reads guest 0 during "
          "boot; matches the low-memory commit in OnPostSetup"},
+#if !defined(__PROSPERO__)  // [ps5 port] PS5: from the settings, below
         {"render_target_path_d3d12", "rov",
          "[measured] rov = 3128 EDRAM resolves and 7 pipelines in 30 s, rtv = 22 "
          "and 0. RTV is effectively broken for this title"},
+#endif
         {"audio_maxqframes", "16",
          "[compat] queued audio frames; 16 is the documented floor and the value "
          "NG2 players use to kill the audio delay"},
+#if !defined(__PROSPERO__)  // [ps5 port] D3D12 only
         {"d3d12_queue_priority", "1",
          "high priority command queue; 2 would need administrator rights"},
+#endif
     };
   }
 
@@ -120,8 +124,13 @@ struct Ng2Tuning {
 
     out.push_back({"present_dither", s.present_dither ? "true" : "false",
                    "dither the 10bpc output down to 8bpc"});
+#if defined(__PROSPERO__)
+    // [ps5 port] Always kept on the PS5: the hub no longer offers the toggle.
+    out.push_back({"present_letterbox", "true", "keep the guest aspect ratio instead of stretching"});
+#else
     out.push_back({"present_letterbox", s.letterbox ? "true" : "false",
                    "keep the guest aspect ratio instead of stretching"});
+#endif
 
     // [compat] gpu-driver-issues-nvidia: the plugin's alpha-test epsilon is the
     // fix for that class of flicker, and it has to be sent unconditionally -
@@ -147,6 +156,41 @@ struct Ng2Tuning {
     // Texture pack. These are GPU PLUGIN cvars, so this file is the only way
     // to deliver them - passing --texture_dump on the command line reaches
     // nothing, which is worth knowing before spending an evening on it.
+#if defined(__PROSPERO__)
+    // [ps5 port] Shader compilation: Smooth builds pipelines off the GPU
+    // thread and skips presenting a frame drawn with a placeholder, so nothing
+    // half-made is ever seen; Exact waits for each one (docs/PS5_PORT.md 5.8).
+    out.push_back({"async_shader_compilation", s.ps5_smooth_shaders ? "true" : "false",
+                   "[ps5] Smooth (true) or Exact (false)"});
+    out.push_back({"vulkan_async_skip_incomplete_frames", "true",
+                   "[ps5] never present a frame that used a placeholder pipeline"});
+    // The Vulkan form of ROV is fragment shader interlock (fsi); RADV exposes
+    // it on the PS5 (confirmed on 13.60). fbo is the host render target path:
+    // cheaper per pixel, less exact (docs/PS5_PORT.md 3.5).
+    out.push_back({"guest_vblank_display_locked", s.ps5_display_locked_vblank ? "true" : "false",
+                   "[ps5] frame pacing: guest vblanks on the display's refresh"});
+    out.push_back({"gpu_phase_timer_details", s.ps5_gpu_timer_details ? "true" : "false",
+                   "[ps5] diagnostics: time the parts of every draw"});
+    out.push_back({"present_low_latency", s.ps5_low_latency ? "true" : "false",
+                   "[ps5] two swapchain images: a refresh less input latency"});
+    // The Flying Swallow flash filter is "coming soon": it did not catch the
+    // game's flash on the console, so it stays off whatever the setting says.
+    out.push_back({"ng2_remove_screen_flash", "false", "[ps5] Flying Swallow flash filter (coming soon)"});
+    out.push_back({"render_target_path_vulkan", s.ps5_render_target_fbo ? "fbo" : "fsi",
+                   "[ps5] fsi = the Vulkan form of rov; fbo = host render targets"});
+    {
+      int after = s.ps5_frame_report_after;
+      if (const char* env = std::getenv("NG2_FRAME_REPORT_AFTER"); env && *env)
+        after = std::atoi(env);
+      out.push_back({"frame_report_after_seconds", std::to_string(after),
+                     "[ps5] diagnostic: frame report this many seconds in (0 off)"});
+    }
+
+#endif
+#if !defined(__PROSPERO__)
+    // [ps5 port] On PS5 the texture dump and the PlayStation button pictures
+    // go through the texture hook in src/ps5/ps5_textures.cpp instead of
+    // these PC plugin cvars, which the PS5 runtime does not have.
     if (s.texture_dump && !s.texture_path.empty()) {
       out.push_back({"texture_dump", "true",
                      "write every unique guest texture out for upscaling"});
@@ -157,6 +201,7 @@ struct Ng2Tuning {
       out.push_back({"texture_pack_path", (s.ResolvedTexturePath() / "pack").generic_string(),
                      "upscaled textures to load instead of the game's own"});
     }
+#endif
 
     // Keyboard-as-pad. The driver is in the runtime and defaults to off, so a
     // PC port that never sets this only works with a real controller.

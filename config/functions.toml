@@ -251,3 +251,47 @@
 #   0x83A56724  stw r11, 4(r22)
 #   ...
 0x83A566F8 = { name = "sub_83A566F8_missed", size = 0xC4 }
+
+# [ps5 port] Virtual-call forwarding thunks the analyzer absorbed into the
+# function before them: `lwz r11,0(r3); lwz r11,slot(r11); mtctr r11; bctr`.
+# The first two crashed the game's options menu (aspect ratio, moving through
+# the settings) on the PS5 build:
+#   [FATAL] Call to invalid or unregistered function at guest address 0x83680E38
+#   [FATAL] Call to invalid or unregistered function at guest address 0x83680E68
+# 0x83680E78 is the next one in the same run (0x83680E18..E78, one per slot);
+# the other four are the remaining copies of the pattern in the image that sit
+# right after a terminator (blr/bctr), i.e. are functions of their own. The 43
+# copies that follow ordinary instructions are tails of larger functions and
+# are left alone.
+
+# .text, absorbed into pdata fn 0x83680D60.
+0x83680E38 = { name = "sub_83680E38_missed", size = 0x10 }
+
+# .text, absorbed into pdata fn 0x83680D60.
+0x83680E68 = { name = "sub_83680E68_missed", size = 0x10 }
+
+# .text, absorbed into pdata fn 0x83680D60.
+0x83680E78 = { name = "sub_83680E78_missed", size = 0x10 }
+
+# .text, absorbed into pdata fn 0x83794B70.
+0x83794C74 = { name = "sub_83794C74_missed", size = 0x10 }
+
+# .text, absorbed into pdata fn 0x83794C88.
+0x83794D14 = { name = "sub_83794D14_missed", size = 0x10 }
+
+# .text, absorbed into pdata fn 0x83794C88.
+0x83794D3C = { name = "sub_83794D3C_missed", size = 0x10 }
+
+# .text, absorbed into pdata fn 0x838715E0.
+0x83871668 = { name = "sub_83871668_missed", size = 0x10 }
+
+# [ps5 port] Every change in the game's own settings menu crashed here on the
+# PS5 build (language, and any other option):
+#   [FATAL] Call to invalid or unregistered function at guest address 0x836AA230
+# A 12-instruction function between the thunk 0x836AA220 (ends in bctr) and
+# 0x836AA260, ending in its own bctr: it loads an entry from a table at
+# r3+8, stores it at r3+0x14 and tail-calls slot 0x4C of the object's
+# vtable - the menu's "option changed" handler.
+
+# .text, absorbed into pdata fn 0x836AA1C8.
+0x836AA230 = { name = "sub_836AA230_missed", size = 0x30 }

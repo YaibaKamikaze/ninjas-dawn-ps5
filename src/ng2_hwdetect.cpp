@@ -1,9 +1,11 @@
 #include "ng2_hwdetect.h"
 
+#if !defined(__PROSPERO__)
 #include <windows.h>
 
 #include <dxgi1_4.h>
 #include <wrl/client.h>
+#endif
 
 #include <algorithm>
 #include <cstdio>
@@ -18,6 +20,7 @@ namespace {
 // multiple of that. Those are the sizes a cache has to hold.
 constexpr uint64_t kGiB = 1024ull * 1024ull * 1024ull;
 
+#if !defined(__PROSPERO__)
 std::string Utf8(const wchar_t* w) {
   if (!w)
     return {};
@@ -28,6 +31,7 @@ std::string Utf8(const wchar_t* w) {
   WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), n, nullptr, nullptr);
   return out;
 }
+#endif
 
 }  // namespace
 
@@ -37,6 +41,18 @@ std::string FormatGiB(uint64_t bytes) {
   return buf;
 }
 
+#if defined(__PROSPERO__)
+// [ps5 port] There is one machine to detect. The PS5's 16 GB is shared by the
+// CPU and the GPU, so there is no "dedicated" figure to size from: the
+// settings are chosen in RecommendSettings from what the console port
+// measured instead.
+GpuInfo DetectGpu() {
+  GpuInfo info;
+  info.valid = true;
+  info.name = "PlayStation 5 GPU (AMD RDNA 2)";
+  return info;
+}
+#else
 GpuInfo DetectGpu() {
   GpuInfo info;
   Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
@@ -83,6 +99,7 @@ GpuInfo DetectGpu() {
     info.budget_bytes = info.dedicated_bytes;
   return info;
 }
+#endif
 
 DetectedSettings RecommendSettings(const GpuInfo& gpu) {
   DetectedSettings out;
@@ -90,6 +107,18 @@ DetectedSettings RecommendSettings(const GpuInfo& gpu) {
     out.summary = "No GPU detected - leaving the memory settings alone.";
     return out;
   }
+
+#if defined(__PROSPERO__)
+  // [ps5 port] A 1 GB texture cache, the size the Skate 3 PS5 port settled on
+  // after its caches grew toward the console's limit over long sessions: in
+  // unified memory every megabyte here is one the game and the runtime do not
+  // have. 2x packs, the size that fits it (about 1.5 GB per chapter at 2x is
+  // the PC measurement; per-stage warming keeps one stage resident).
+  out.texture_cache_mb = 1024;
+  out.texture_scale = 2;
+  out.summary = gpu.name + ", 16 GB shared memory. Cache 1 GB, 2x upscale.";
+  return out;
+#endif
 
   // Sized against the card's OWN memory, not against what happens to be free.
   //

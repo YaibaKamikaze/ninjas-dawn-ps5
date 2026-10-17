@@ -1,5 +1,9 @@
 #include "ng2_perf.h"
 
+#if defined(__PROSPERO__)
+#include <sys/resource.h>
+#include <unistd.h>
+#else
 #include <windows.h>
 
 #include <dxgi1_4.h>
@@ -7,6 +11,7 @@
 #include <pdhmsg.h>
 #include <psapi.h>
 #include <wrl/client.h>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -15,8 +20,10 @@
 
 #include <rex/logging.h>
 
+#if !defined(__PROSPERO__)
 #pragma comment(lib, "pdh.lib")
 #pragma comment(lib, "psapi.lib")
+#endif
 
 namespace ng2 {
 namespace {
@@ -30,6 +37,60 @@ std::atomic<bool> g_stop{false};
 std::atomic<bool> g_started{false};
 std::atomic<uint32_t> g_frames{0};
 
+#if defined(__PROSPERO__)
+// [ps5 port] The same readouts from what the console offers. CPU is this
+// process's user + system time over wall time, across the cores it can run
+// on. There is no per-process GPU counter or separate video memory on the PS5
+// (its 16 GB is shared), so those readouts report themselves unavailable and
+// the overlay leaves them out, exactly as it does for a PC without them.
+class CpuMeter {
+ public:
+  float Sample() {
+    rusage usage{};
+    if (getrusage(RUSAGE_SELF, &usage) != 0)
+      return 0.0f;
+    const double busy = Seconds(usage.ru_utime) + Seconds(usage.ru_stime);
+    const auto now = std::chrono::steady_clock::now();
+    float percent = 0.0f;
+    if (have_previous_) {
+      const double seconds = std::chrono::duration<double>(now - previous_at_).count();
+      if (seconds > 0.0)
+        percent = float((busy - previous_busy_) / seconds / double(cores_) * 100.0);
+    }
+    previous_busy_ = busy;
+    previous_at_ = now;
+    have_previous_ = true;
+    return percent < 0.0f ? 0.0f : (percent > 100.0f ? 100.0f : percent);
+  }
+
+ private:
+  static double Seconds(const timeval& t) { return double(t.tv_sec) + double(t.tv_usec) / 1e6; }
+  static uint32_t CoreCount() {
+    const long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? uint32_t(n) : 8;
+  }
+  double previous_busy_ = 0.0;
+  std::chrono::steady_clock::time_point previous_at_{};
+  bool have_previous_ = false;
+  uint32_t cores_ = CoreCount();
+};
+
+class GpuMeter {
+ public:
+  bool Open() { return false; }
+  void Refresh() {}
+  bool Sample(float&) { return false; }
+  void Close() {}
+};
+
+bool SampleVram(float&, float&) { return false; }
+
+// TODO(ps5): the process's resident memory against the app's budget, from the
+// kernel's direct/flexible memory queries, once their declarations in the
+// payload SDK are confirmed on the console.
+bool SampleRam(float&, float&) { return false; }
+
+#else
 // --- CPU -------------------------------------------------------------------
 
 // This process's share of all cores. GetProcessTimes gives cumulative kernel +
@@ -218,6 +279,7 @@ bool SampleRam(float& used_mb, float& total_mb) {
   total_mb = float(double(ms.ullTotalPhys) / (1024.0 * 1024.0));
   return true;
 }
+#endif  // __PROSPERO__
 
 void SampleLoop() {
   CpuMeter cpu;

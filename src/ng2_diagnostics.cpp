@@ -1,9 +1,12 @@
 #include "ng2_diagnostics.h"
 
+#if !defined(__PROSPERO__)
 #include <windows.h>
 #include <shellapi.h>
+#endif
 
 #include <algorithm>
+#include <cstring>
 #include <chrono>
 #include <ctime>
 #include <deque>
@@ -31,7 +34,11 @@ constexpr size_t kMaxLogLines = 4000;
 std::string TimeStamp(const char* format) {
   const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
   std::tm tm{};
+#if defined(__PROSPERO__)
+  localtime_r(&now, &tm);
+#else
   localtime_s(&tm, &now);
+#endif
   char buffer[64];
   std::strftime(buffer, sizeof(buffer), format, &tm);
   return buffer;
@@ -100,6 +107,13 @@ void AppendFile(std::ostream& out, const fs::path& path, const char* title,
     out << l << "\n";
 }
 
+#if defined(__PROSPERO__)
+// [ps5 port] One machine: say which, and leave the firmware to the log, where
+// the runtime records what it found.
+std::string OsVersion() { return "PlayStation 5 (jailbroken, homebrew app)"; }
+std::string CpuName() { return "AMD Zen 2, 8 cores / 16 threads, 3.5 GHz"; }
+double GigabytesOfRam() { return 16.0; }
+#else
 std::string OsVersion() {
   // GetVersionEx lies without a manifest; the registry keeps the real thing.
   HKEY key{};
@@ -160,8 +174,16 @@ double GigabytesOfRam() {
     return 0.0;
   return double(status.ullTotalPhys) / (1024.0 * 1024.0 * 1024.0);
 }
+#endif
 
 }  // namespace
+
+#if defined(__PROSPERO__)
+// [ps5 port] No clipboard and no file browser on the console: the file is
+// written to logs/, the folder players already send over FTP.
+bool CopyToClipboard(const std::string&) { return false; }
+void RevealInExplorer(const fs::path&) {}
+#else
 
 bool CopyToClipboard(const std::string& text) {
   if (!OpenClipboard(nullptr))
@@ -189,10 +211,15 @@ void RevealInExplorer(const fs::path& file) {
   const std::string argument = "/select,\"" + file.string() + "\"";
   ShellExecuteA(nullptr, "open", "explorer.exe", argument.c_str(), nullptr, SW_SHOWNORMAL);
 }
+#endif
 
 DiagnosticsResult WriteDiagnostics(const fs::path& settings_file, const fs::path& log_dir) {
   DiagnosticsResult result;
+#if defined(__PROSPERO__)
+  const fs::path out_dir = log_dir.empty() ? rex::filesystem::GetExecutableFolder() / "logs" : log_dir;
+#else
   const fs::path out_dir = rex::filesystem::GetExecutableFolder() / "diagnostics";
+#endif
   std::error_code ec;
   fs::create_directories(out_dir, ec);
   if (ec) {
@@ -211,7 +238,12 @@ DiagnosticsResult WriteDiagnostics(const fs::path& settings_file, const fs::path
   out << "Ninja Gaiden II recompilation - diagnostics\n";
   out << "Written " << TimeStamp("%Y-%m-%d %H:%M:%S") << "\n";
   out << "Port version: " << NG2_VERSION << "\n";
+#if defined(__PROSPERO__)
+  out << "PS5 version:  " << NG2_PS5_VERSION << "\n";
+  out << "Executable:   " << (rex::filesystem::GetExecutableFolder() / "eboot.bin").string() << "\n";
+#else
   out << "Executable:   " << (rex::filesystem::GetExecutableFolder() / "ng2.exe").string() << "\n";
+#endif
 
   out << "\n===== Machine =====\n";
   out << "OS:   " << OsVersion() << "\n";
@@ -224,7 +256,12 @@ DiagnosticsResult WriteDiagnostics(const fs::path& settings_file, const fs::path
     char vram[64];
     std::snprintf(vram, sizeof(vram), "%.1f GB",
                   double(gpu.dedicated_bytes) / (1024.0 * 1024.0 * 1024.0));
+#if defined(__PROSPERO__)
+    (void)vram;
+    out << "GPU:  " << gpu.name << " (16 GB memory shared with the CPU)\n";
+#else
     out << "GPU:  " << gpu.name << " (" << vram << " dedicated)\n";
+#endif
   } else {
     out << "GPU:  not readable through DXGI\n";
   }

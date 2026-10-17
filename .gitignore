@@ -37,3 +37,14 @@ docs/texpack/*.png
 
 # third-party AI upscaler engine + models (Real-ESRGAN ncnn-vulkan; shipped in the release zip, not in git)
 tools/upscaler/
+
+# [ps5 port] The PS5 package's own folders and artwork are ours and tracked;
+# the rules above (DLC/, *.dds) are meant for game material elsewhere.
+!ps5/package/DLC/
+!ps5/package/hub/**/*.dds
+# Release-only home-screen art and hub music (not ours to put in the
+# repository; see ps5/package/sce_sys/README.txt and hub/music/README.txt).
+ps5/package/sce_sys/pic*.dds
+ps5/package/hub/music/*.wav
+# The SDK checkout made by ps5/tools/setup-linux.sh.
+third_party/rexglue-sdk/

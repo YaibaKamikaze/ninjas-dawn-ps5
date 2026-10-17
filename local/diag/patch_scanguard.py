@@ -28,6 +28,28 @@ import os
 GEN = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                     "..", "..", "generated", "default"))
 
+
+# [ps5 port] Where a function lands among the ng2_recomp.N.cpp shards depends
+# on the SDK build that ran codegen (the Linux codegen for the PS5 port splits
+# them differently from the Windows one), and the listed shards used a Windows
+# path separator. The listed shard is tried first; if it does not hold the
+# anchor (or the fix), the one shard that does is used instead.
+import glob
+
+
+def shard(path, *needles):
+    def holds(p):
+        try:
+            with open(p, encoding="utf-8", errors="replace") as fh:
+                t = fh.read()
+        except OSError:
+            return False
+        return any(n in t for n in needles)
+    if holds(path):
+        return path
+    found = [p for p in sorted(glob.glob(os.path.join(GEN, "ng2_recomp.*.cpp"))) if holds(p)]
+    return found[0] if len(found) == 1 else path
+
 # (file, function, list-pointer register expr, point-id)
 # The complete transition command-list scanner family reachable from sub_82445440
 # that scans-until-terminator (0x80000018 / 0x80000003 / -1) and so runs off a
@@ -35,10 +57,10 @@ GEN = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # terminator-pattern filter (local/diag find_scanners); the counted-loop and
 # already-null-checked candidates were excluded.
 SCANNERS = [
-    (GEN + r"\ng2_recomp.267.cpp", "sub_82467E70", "ctx.r3.u32", 6),
-    (GEN + r"\ng2_recomp.325.cpp", "sub_82467FF8", "ctx.r4.u32", 7),
-    (GEN + r"\ng2_recomp.448.cpp", "sub_82467D68", "ctx.r4.u32", 8),
-    (GEN + r"\ng2_recomp.408.cpp", "sub_82484658", "ctx.r3.u32", 9),
+    (os.path.join(GEN, "ng2_recomp.267.cpp"), "sub_82467E70", "ctx.r3.u32", 6),
+    (os.path.join(GEN, "ng2_recomp.325.cpp"), "sub_82467FF8", "ctx.r4.u32", 7),
+    (os.path.join(GEN, "ng2_recomp.448.cpp"), "sub_82467D68", "ctx.r4.u32", 8),
+    (os.path.join(GEN, "ng2_recomp.408.cpp"), "sub_82484658", "ctx.r3.u32", 9),
 ]
 
 
@@ -56,6 +78,7 @@ def inject(func, reg, pt):
 def main():
     revert = "--revert" in sys.argv
     for path, func, reg, pt in SCANNERS:
+        path = shard(path, anchor(func), inject(func, reg, pt))  # [ps5 port]
         with open(path, encoding="utf-8", errors="replace") as fh:
             t = fh.read()
         a, inj = anchor(func), inject(func, reg, pt)

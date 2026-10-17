@@ -1,6 +1,8 @@
 #include "ng2_textool.h"
 
+#if !defined(__PROSPERO__)
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -43,6 +45,21 @@ namespace {
 // exit code comes back in `exit_code`. When `cancel` becomes true the tree is
 // killed within about 50 ms and this returns true with a non-zero exit code;
 // the caller reads `cancel` to tell that apart from a failure.
+#if defined(__PROSPERO__)
+// [ps5 port] A homebrew app cannot start other programs, and there is no
+// Python on the console: packs are made on a PC with the PC port's tools and
+// copied to Texture Packs/. Reporting "could not start" is what every caller
+// already handles, and the hub does not offer the processing buttons.
+using DWORD = unsigned long;
+bool RunHidden(const std::string& command_line,
+               const std::function<void(const std::string&)>&,
+               DWORD* exit_code = nullptr,
+               const std::atomic<bool>* = nullptr) {
+  REXLOG_INFO("Texture tools: not available on the PS5 ({})", command_line);
+  if (exit_code) *exit_code = 1;
+  return false;
+}
+#else
 bool RunHidden(const std::string& command_line,
                const std::function<void(const std::string&)>& on_line,
                DWORD* exit_code = nullptr,
@@ -143,6 +160,7 @@ bool RunHidden(const std::string& command_line,
     CloseHandle(job);  // and with it anything still running under the job
   return true;
 }
+#endif  // __PROSPERO__
 
 // Whether `exe` runs at all, via `where` so the same rules apply as when the
 // player types the name themselves.

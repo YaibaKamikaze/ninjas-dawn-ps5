@@ -94,6 +94,14 @@ bool MonitorFullSize(int index, int& width, int& height);
 // the caller should quit rather than pretend a menu is coming.
 bool LaunchDetached(const std::filesystem::path& exe, const std::string& args);
 
+// [ps5 port] Ends the process now, without running destructors - what
+// std::_Exit did at every call site. On the PS5 a title must ask the system
+// shell to close it: _Exit, exit() and returning from main all kill the
+// process, and the console then reports a crash over a run that worked. On
+// the PS5, LaunchDetached above reloads the app (into its hub) the same way
+// and does not return when it succeeds.
+[[noreturn]] void ExitNow(int code);
+
 // Human-readable byte count ("6.7 GB"), for the disc and progress readouts.
 std::string FormatBytes(uint64_t bytes);
 

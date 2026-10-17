@@ -100,7 +100,12 @@ SaveInfo InspectSavePackage(const std::filesystem::path& path) {
   // Only the metadata block is needed, and a save is 88 KB, so this reads a
   // bounded prefix rather than the whole package.
   FILE* f = nullptr;
+#if defined(__PROSPERO__)
+  f = std::fopen(path.c_str(), "rb");  // [ps5 port] narrow paths
+  if (f == nullptr) {
+#else
   if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || f == nullptr) {
+#endif
     info.message = "Could not open that file.";
     return info;
   }

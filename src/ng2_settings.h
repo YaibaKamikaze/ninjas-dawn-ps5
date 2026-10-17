@@ -28,6 +28,10 @@
 #include <rex/filesystem.h>
 #include <rex/logging.h>
 
+#if defined(__PROSPERO__)
+#include "ps5/ps5_paths.h"
+#endif
+
 struct Ng2Settings {
   // --- Display (restart) -------------------------------------------------
   int window_width = 1280;
@@ -282,9 +286,60 @@ struct Ng2Settings {
   // interrupts the first run. Hold Shift at launch to get it back.
   bool configured = false;
 
+#if defined(__PROSPERO__)
+  // --- PS5 (restart) - [ps5 port] -----------------------------------------
+  // The resolution presets (docs/PS5_PORT.md 5.7): 0 = 4K, 1 = 1440p, 2 = 720p. Each
+  // is an exact integer scale of the 1280x720 base (3x, 2x, 1x), which is the
+  // only kind of scale the Xenos backend renders; 1080p would be 1.5x and is
+  // not offered for that reason.
+  int ps5_resolution = 1;  // 1440p: the tested default (hub_settings.cpp)
+  // 0 = the scale the resolution implies; 1..3 forces one (Advanced).
+  int ps5_render_scale = 0;
+  // The one asset change: the PlayStation button pictures (5.9).
+  bool ps5_playstation_prompts = true;
+  // Smooth = pipelines built off the GPU thread, the frames that would have
+  // drawn with a placeholder skipped; Exact = wait for every pipeline (5.8).
+  bool ps5_smooth_shaders = true;
+  // Developer: write every small picture the game loads to logs/hud_pictures,
+  // which is how the Xbox button pictures are found (M7).
+  bool ps5_dump_hud_pictures = false;
+  // Render target path: the host's own render targets (faster) instead of
+  // fragment shader interlock (exact EDRAM emulation, the default).
+  bool ps5_render_target_fbo = false;
+  // Frame pacing: guest vblanks on the display's refresh (smooth) or the
+  // runtime's own 60 Hz timer.
+  bool ps5_display_locked_vblank = true;
+  // Leave out the white screen flash of the Flying Swallow (and any move
+  // that flashes the screen the same way). The original has it; on by
+  // default for comfort, a toggle away.
+  bool ps5_remove_screen_flash = false;  // (coming soon: not applied yet)
+  // Two swapchain images instead of three: about a refresh (16 ms) less input
+  // latency; Standard (three, as before) gives a late paint more slack and is
+  // the default until Low is shown not to cost smoothness.
+  bool ps5_low_latency = false;
+  // Diagnostics: time the parts of every draw (costs frame rate).
+  bool ps5_gpu_timer_details = false;
+  // Developer, diagnostic: capture a frame report this many seconds after
+  // the first frame (0 off) - every rendered image of two frames, written to
+  // logs/frame_reports - not saved on.
+  int ps5_frame_report_after = 0;
+  // The hub's menu music from hub/music, off by default.
+  bool ps5_menu_music = true;
+  // The PS5's own first-run values have been applied over the PC defaults.
+  bool ps5_defaults_applied = false;
+  // Which round of PS5 defaults this file has had (kPs5DefaultsVersion in
+  // hub_settings.h): a later round moves existing installs once.
+  int ps5_defaults_version = 0;
+#endif
+
 
   static std::filesystem::path Path() {
+#if defined(__PROSPERO__)
+    // [ps5 port] With the rest of what the app writes, in UserData/.
+    return ng2ps5::paths::UserData() / "ng2_settings.cfg";
+#else
     return rex::filesystem::GetExecutableFolder() / "ng2_settings.cfg";
+#endif
   }
 
   // A path from the settings file, absolute or relative to the executable's
@@ -303,6 +358,11 @@ struct Ng2Settings {
   // Where the game data actually comes from: the configured folder, or game/
   // beside the executable.
   std::filesystem::path ResolvedGamePath() const {
+#if defined(__PROSPERO__)
+    // [ps5 port] Always the app's Game Data folder: there is no picker, and
+    // the player copies the disc there over FTP.
+    return rex::filesystem::GetExecutableFolder() / "Game Data";
+#endif
     if (!game_path.empty())
       return Beside(game_path);
     return rex::filesystem::GetExecutableFolder() / "game";
@@ -320,6 +380,9 @@ struct Ng2Settings {
   }
 
   std::filesystem::path ResolvedDlcPath() const {
+#if defined(__PROSPERO__)
+    return rex::filesystem::GetExecutableFolder() / "DLC";  // [ps5 port]
+#endif
     if (!dlc_path.empty())
       return Beside(dlc_path);
     return rex::filesystem::GetExecutableFolder() / "dlc";
@@ -408,6 +471,23 @@ struct Ng2Settings {
         << "check_for_updates=" << (check_for_updates ? 1 : 0) << "\n"
         << "cursor_hide_seconds=" << cursor_hide_seconds << "\n"
         << "configured=" << (configured ? 1 : 0) << "\n";
+#if defined(__PROSPERO__)
+    // [ps5 port]
+    out << "ps5_resolution=" << ps5_resolution << "\n"
+        << "ps5_render_scale=" << ps5_render_scale << "\n"
+        << "ps5_playstation_prompts=" << (ps5_playstation_prompts ? 1 : 0) << "\n"
+        << "ps5_smooth_shaders=" << (ps5_smooth_shaders ? 1 : 0) << "\n"
+        << "ps5_dump_hud_pictures=" << (ps5_dump_hud_pictures ? 1 : 0) << "\n"
+        << "ps5_render_target_fbo=" << (ps5_render_target_fbo ? 1 : 0) << "\n"
+        << "ps5_display_locked_vblank=" << (ps5_display_locked_vblank ? 1 : 0) << "\n"
+        << "ps5_remove_screen_flash=" << (ps5_remove_screen_flash ? 1 : 0) << "\n"
+        << "ps5_low_latency=" << (ps5_low_latency ? 1 : 0) << "\n"
+        << "ps5_gpu_timer_details=" << (ps5_gpu_timer_details ? 1 : 0) << "\n"
+
+        << "ps5_menu_music=" << (ps5_menu_music ? 1 : 0) << "\n"
+        << "ps5_defaults_applied=" << (ps5_defaults_applied ? 1 : 0) << "\n"
+        << "ps5_defaults_version=" << ps5_defaults_version << "\n";
+#endif
     REXLOG_INFO("Settings: saved {}", Path().string());
   }
 
@@ -443,6 +523,15 @@ struct Ng2Settings {
     // makes it impossible to arrive with, from an older config or a hand edit.
     if (texture_dump && texture_pack)
       texture_pack = false;
+#if defined(__PROSPERO__)
+    // [ps5 port]
+    ps5_resolution = std::clamp(ps5_resolution, 0, 2);
+    ps5_render_scale = std::clamp(ps5_render_scale, 0, 3);
+    fullscreen = true;
+    ultrawide = false;
+    keyboard_control = false;
+    check_for_updates = false;
+#endif
   }
 
  private:
@@ -500,5 +589,22 @@ struct Ng2Settings {
     else if (k == "game_path") game_path = v;
     else if (k == "dlc_path") dlc_path = v;
     else if (k == "configured") configured = Truthy(v);
+#if defined(__PROSPERO__)
+    // [ps5 port]
+    else if (k == "ps5_resolution") ps5_resolution = std::atoi(v.c_str());
+    else if (k == "ps5_render_scale") ps5_render_scale = std::atoi(v.c_str());
+    else if (k == "ps5_playstation_prompts") ps5_playstation_prompts = Truthy(v);
+    else if (k == "ps5_smooth_shaders") ps5_smooth_shaders = Truthy(v);
+    else if (k == "ps5_dump_hud_pictures") ps5_dump_hud_pictures = Truthy(v);
+    else if (k == "ps5_render_target_fbo") ps5_render_target_fbo = Truthy(v);
+    else if (k == "ps5_display_locked_vblank") ps5_display_locked_vblank = Truthy(v);
+    else if (k == "ps5_remove_screen_flash") ps5_remove_screen_flash = Truthy(v);
+    else if (k == "ps5_low_latency") ps5_low_latency = Truthy(v);
+    else if (k == "ps5_gpu_timer_details") ps5_gpu_timer_details = Truthy(v);
+
+    else if (k == "ps5_menu_music") ps5_menu_music = Truthy(v);
+    else if (k == "ps5_defaults_applied") ps5_defaults_applied = Truthy(v);
+    else if (k == "ps5_defaults_version") ps5_defaults_version = std::atoi(v.c_str());
+#endif
   }
 };

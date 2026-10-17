@@ -1339,7 +1339,7 @@ void DrawDiagnosticsSection() {
     ImGui::SameLine();
     ImGui::TextColored(status_ok ? kGood : kBad, "%s", status.c_str());
   }
-  Muted("Written to diagnostics\ beside the game. Have a look before you "
+  Muted("Written to diagnostics\\ beside the game. Have a look before you "
         "post it - it names your folders.");
 }
 

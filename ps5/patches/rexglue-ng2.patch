@@ -1,0 +1,1839 @@
+diff --git a/include/rex/codegen/config.h b/include/rex/codegen/config.h
+index 8200139a..0f8d086f 100644
+--- a/include/rex/codegen/config.h
++++ b/include/rex/codegen/config.h
+@@ -97,6 +97,12 @@ struct RecompilerConfig {
+   bool nonArgumentRegistersAsLocalVariables = false;
+   bool nonVolatileRegistersAsLocalVariables = false;
+   bool generateExceptionHandlers = false;  ///< Generate SEH exception handler wrappers
++  /// [ng2] VMX128 registers kept in the shared PPCContext even when
++  /// non_volatile_as_local localises v64-v127. Only registers that really
++  /// carry a value between functions belong here: the recompiler emits no
++  /// code for __savevmx/__restvmx, so a shared register used as scratch is
++  /// never restored and clobbers its caller (Ninja Gaiden II R3/R4).
++  std::unordered_set<uint32_t> sharedVectorRegisters;
+ 
+   // === Analysis tuning (optional) ===
+   uint32_t maxJumpExtension = 65536;  ///< Max bytes to extend function for jump table targets
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+index 751a6860..2f58f3ef 100644
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -254,6 +254,9 @@ class CommandProcessor {
+   uint32_t primary_buffer_size_ = 0;
+ 
+   uint32_t read_ptr_index_ = 0;
++  // [ng2] Bumped by InitializeRingBuffer: a pass that started before a
++  // re-initialisation must not write its old read pointer back after it.
++  std::atomic<uint32_t> ring_epoch_{0};
+   uint32_t read_ptr_update_freq_ = 0;
+   uint32_t read_ptr_writeback_ptr_ = 0;
+ 
+diff --git a/include/rex/graphics/ng2_phase_timer.h b/include/rex/graphics/ng2_phase_timer.h
+new file mode 100644
+index 00000000..b30617a1
+--- /dev/null
++++ b/include/rex/graphics/ng2_phase_timer.h
+@@ -0,0 +1,80 @@
++// [ng2 ps5 port] Where the GPU command thread's time goes.
++//
++// The command thread turns the game's GPU command stream into Vulkan work. When
++// it is busy close to 1000 ms/s it is what limits the frame rate, and this says
++// which part of its work is responsible: every 10 s as a line beside the busy
++// figure, and for any single frame that took longer than 50 ms, so a hitch can
++// be put down to a cause (a pipeline, a texture upload, a resolve, a wait for
++// the presenter or the host GPU - or, when the thread was idle, the game itself).
++//
++// Phases nest: texture loads, pipeline creation and fence waits happen inside
++// draws and submissions, so the figures are not meant to add up.
++//
++// Reading the clock is not free on the PS5 (clock_gettime), and draws come by
++// the thousand each frame: the per-draw phases (Scope with detail = true) run
++// only while the gpu_phase_timer_details cvar is on (SETTINGS > Developer).
++// The rest happen a few times a frame and always run.
++#pragma once
++
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++
++namespace rex::graphics::ng2phase {
++
++enum Phase : int {
++  kBusy,         // executing the command stream (the busy figure)
++  kDraw,         // IssueDraw, resolves included
++  kCopy,         // resolves (EDRAM -> memory copies)
++  kSwap,         // the end of a frame, handing it to the presenter
++  kSubmit,       // EndSubmission: recording and vkQueueSubmit
++  kTextureLoad,  // texture uploads and untiling
++  kPipeline,     // vkCreateGraphicsPipelines on the command thread
++  kFenceWait,    // waiting for the host GPU
++  kRegWait,      // the game's WAIT_REG_MEM
++  // Inside a draw:
++  kPrimitives,     // primitive processing (index conversion, vertex ranges)
++  kTextures,       // RequestTextures (texture loads counted again above)
++  kRenderTargets,  // the render target cache's Update
++  kBindings,       // UpdateBindings: constants and descriptor sets
++  kLockWait,       // waiting for the global lock in shared memory requests
++  kCount,
++};
++
++inline std::atomic<int64_t> g_window_ns[kCount];
++inline std::atomic<uint32_t> g_window_pipelines_async{0};
++inline std::atomic<uint32_t> g_window_draws{0};
++inline thread_local bool tls_command_thread = false;
++// gpu_phase_timer_details, refreshed by the command thread once per batch.
++inline bool g_details = false;
++inline thread_local int64_t tls_frame_ns[kCount];
++
++inline int64_t NowNs() {
++  return std::chrono::duration_cast<std::chrono::nanoseconds>(
++             std::chrono::steady_clock::now().time_since_epoch())
++      .count();
++}
++
++inline void Add(Phase phase, int64_t ns) {
++  g_window_ns[phase].fetch_add(ns, std::memory_order_relaxed);
++  if (tls_command_thread)
++    tls_frame_ns[phase] += ns;
++}
++
++struct Scope {
++  explicit Scope(Phase p, bool detail = false) : phase(p), start(detail && !g_details ? -1 : NowNs()) {}
++  ~Scope() {
++    if (start >= 0)
++      Add(phase, NowNs() - start);
++  }
++  Scope(const Scope&) = delete;
++  Scope& operator=(const Scope&) = delete;
++  Phase phase;
++  int64_t start;
++};
++
++// Called by the command thread after each swap: logs the frame's breakdown
++// when it took longer than 50 ms (command_processor.cpp).
++void EndFrame();
++
++}  // namespace rex::graphics::ng2phase
+diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
+index 4d85a2b5..ff02ee27 100644
+--- a/include/rex/graphics/shared_memory.h
++++ b/include/rex/graphics/shared_memory.h
+@@ -160,6 +160,8 @@ class SharedMemory {
+   // Ranges that need to be uploaded, generated by GetRangesToUpload (a
+   // persistently allocated vector).
+   std::vector<std::pair<uint32_t, uint32_t>> upload_ranges_;
++  // [ps5 port] RequestRanges' merge list, kept between calls (WWE 2K14 Recomp's 0050).
++  std::vector<std::pair<uint32_t, uint32_t>> request_ranges_scratch_;
+ 
+   // Mutex between the guest memory subsystem and the command processor, to be
+   // locked when checking or updating validity of pages/ranges and when firing
+diff --git a/include/rex/graphics/texture_load_hook.h b/include/rex/graphics/texture_load_hook.h
+new file mode 100644
+index 00000000..ca7ad1da
+--- /dev/null
++++ b/include/rex/graphics/texture_load_hook.h
+@@ -0,0 +1,40 @@
++/**
++ * @file        rex/graphics/texture_load_hook.h
++ * @brief       [ng2] A title's look at each guest texture just before the GPU
++ *              copy of its memory is brought up to date: for dumping it (the
++ *              texture pack tools) and for writing a replacement over it in
++ *              guest memory (the PS5 port's PlayStation button prompts).
++ *
++ * Called on the GPU thread from TextureCache::PrepareTextureLoad, for the base
++ * level of a non-resolve texture whose guest memory changed or was never
++ * loaded, BEFORE the shared memory upload: bytes the hook writes into guest
++ * memory are the bytes the texture is made from. Keep it cheap - it runs once
++ * per (re)load, and anything slow belongs on a thread of the title's own.
++ */
++#pragma once
++
++#include <cstdint>
++
++namespace rex::graphics {
++
++struct GuestTextureLoad {
++  uint32_t base_address;  // physical guest address of the base level
++  uint32_t base_size;     // its guest extent in bytes (tiling padding included)
++  uint32_t width, height;
++  uint32_t pitch;          // TextureKey::pitch (32-texel units)
++  uint32_t format;         // xenos::TextureFormat
++  uint32_t endianness;     // xenos::Endian
++  uint32_t tiled;
++  uint32_t dimension;      // xenos::DataDimension
++  uint32_t depth_or_array_size;
++  uint32_t mip_max_level;
++  uint32_t packed_mips;
++};
++
++using GuestTextureLoadHook = void (*)(const GuestTextureLoad& texture);
++
++// One hook per process; nullptr removes it.
++void SetGuestTextureLoadHook(GuestTextureLoadHook hook);
++GuestTextureLoadHook GetGuestTextureLoadHook();
++
++}  // namespace rex::graphics
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index ab4ced07..949f48a8 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -268,6 +268,9 @@ class VulkanCommandProcessor : public CommandProcessor {
+   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
+                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
+   bool IssueCopy() override;
++  // [ng2 ps5 port] The screen flash filter (command_processor.cpp).
++  bool IsScreenFlashDraw(const VulkanShader& pixel_shader, const PrimitiveProcessor::ProcessingResult& primitives);
++  void FrameReportResolve(uint32_t written_address, uint32_t written_length);  // [ng2 ps5 port]
+ 
+  private:
+   struct CommandBuffer {
+diff --git a/include/rex/graphics/vulkan/render_target_cache.h b/include/rex/graphics/vulkan/render_target_cache.h
+index 34f70337..83efe6a0 100644
+--- a/include/rex/graphics/vulkan/render_target_cache.h
++++ b/include/rex/graphics/vulkan/render_target_cache.h
+@@ -101,6 +101,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+   Path GetPath() const override { return path_; }
+ 
+   VkBuffer edram_buffer() const { return edram_buffer_; }
++  // [ng2 ps5 port] For frame reports: the EDRAM buffer made readable by a
++  // transfer (the barrier is recorded; the caller submits it).
++  void UseEdramBufferForTransferRead() { UseEdramBuffer(EdramBufferUsage::kTransferRead); }
+ 
+   // Performs the resolve to a shared memory area according to the current
+   // register values, and also clears the render targets if needed. Must be in a
+diff --git a/include/rex/ppc/intrinsics.h b/include/rex/ppc/intrinsics.h
+index 3c2fe090..11b8c87b 100644
+--- a/include/rex/ppc/intrinsics.h
++++ b/include/rex/ppc/intrinsics.h
+@@ -16,6 +16,7 @@
+ #include <climits>
+ #include <cmath>
+ #include <cstring>
++#include <thread>
+ 
+ #include <simde/x86/avx.h>
+ #include <simde/x86/avx2.h>
+@@ -393,6 +394,19 @@ inline simde__m128i simde_mm_sllv_epi8(simde__m128i a, simde__m128i count) {
+   return simde_mm_packus_epi16(r_lo, r_hi);
+ }
+ 
++// [ng2] db16cyc: a PAUSE, and a real yield every 1024 executions per thread.
++inline void db16cyc() {
++#if defined(__x86_64__) || defined(_M_X64)
++  __builtin_ia32_pause();
++#elif defined(__aarch64__) || defined(_M_ARM64)
++  __asm__ __volatile__("yield");
++#endif
++  static thread_local uint32_t count = 0;
++  if ((++count & 1023) == 0) {
++    std::this_thread::yield();
++  }
++}
++
+ }  // namespace rex::ppc
+ 
+ //=============================================================================
+@@ -400,6 +414,7 @@ inline simde__m128i simde_mm_sllv_epi8(simde__m128i a, simde__m128i count) {
+ //=============================================================================
+ // Vector mask tables accessible from global scope for generated code
+ using rex::ppc::VectorMaskL;
++#define ppc_db16cyc() ::rex::ppc::db16cyc()
+ using rex::ppc::VectorMaskR;
+ using rex::ppc::VectorShiftTableL;
+ using rex::ppc::VectorShiftTableR;
+diff --git a/include/rex/ui/display_clock.h b/include/rex/ui/display_clock.h
+new file mode 100644
+index 00000000..76b8cd1c
+--- /dev/null
++++ b/include/rex/ui/display_clock.h
+@@ -0,0 +1,45 @@
++/**
++ * @file        rex/ui/display_clock.h
++ * @brief       [ng2 ps5 port] When the display last refreshed, and how often
++ *              it does: measured by the presenter, read by the guest vblank
++ *              timer so the game's frames are paced by the panel rather than
++ *              by a free-running clock (graphics_system.cpp).
++ *
++ * On the PS5 the presenter paints every refresh and its swapchain acquire
++ * returns when the previous flip happened, so the moment an acquire that had
++ * to wait returns is a display vblank. Elsewhere nothing writes these and the
++ * timer runs as before.
++ */
++#pragma once
++
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++
++namespace rex::ui::display_clock {
++
++inline std::atomic<int64_t> last_vblank_ns{0};  // steady_clock, 0: unknown
++inline std::atomic<int64_t> period_ns{0};       // averaged, 0: unknown
++
++inline int64_t NowNs() {
++  return std::chrono::duration_cast<std::chrono::nanoseconds>(
++             std::chrono::steady_clock::now().time_since_epoch())
++      .count();
++}
++
++// From the presenter, after an acquire that waited `waited_ns` for a flip.
++inline void NoteAcquire(int64_t waited_ns) {
++  if (waited_ns < 3'000'000) {
++    return;  // (an image was free: no flip was waited for)
++  }
++  const int64_t now = NowNs();
++  const int64_t previous = last_vblank_ns.exchange(now, std::memory_order_acq_rel);
++  const int64_t interval = previous ? now - previous : 0;
++  // Only one-refresh intervals between 50 and 80 Hz count towards the period.
++  if (interval >= 12'500'000 && interval <= 20'000'000) {
++    const int64_t period = period_ns.load(std::memory_order_relaxed);
++    period_ns.store(period ? period + (interval - period) / 16 : interval, std::memory_order_relaxed);
++  }
++}
++
++}  // namespace rex::ui::display_clock
+diff --git a/include/rex/ui/flags.h b/include/rex/ui/flags.h
+index fa2ef605..84b1e5f2 100644
+--- a/include/rex/ui/flags.h
++++ b/include/rex/ui/flags.h
+@@ -35,6 +35,7 @@ REXCVAR_DECLARE(std::string, video_driver);
+ // Display (guest video mode; defined in src/ui/window.cpp)
+ REXCVAR_DECLARE(int32_t, video_mode_width);
+ REXCVAR_DECLARE(int32_t, video_mode_height);
++REXCVAR_DECLARE(bool, video_mode_explicit);  // [ng2 D7]
+ REXCVAR_DECLARE(double, video_mode_refresh_rate);
+ REXCVAR_DECLARE(std::string, resolution);
+ 
+diff --git a/src/audio/ps5/ps5_audio_driver.cpp b/src/audio/ps5/ps5_audio_driver.cpp
+index 3fbc549d..a1ff2e7d 100644
+--- a/src/audio/ps5/ps5_audio_driver.cpp
++++ b/src/audio/ps5/ps5_audio_driver.cpp
+@@ -70,8 +70,8 @@ void Ps5AudioDriver::SubmitFrame(uint32_t frame_ptr) {
+ 
+ // sceAudioOutOutput blocks until the previous buffer has started playing, so
+ // this loop runs at exactly the output rate (one frame per 5.33 ms): a queued
+-// game frame when there is one (then the game may submit another: release
+-// the semaphore), else silence.
++// game frame when there is one, else silence. Either way the game may submit
++// another frame, so the semaphore is released on every pass.
+ void Ps5AudioDriver::OutputThread() {
+   float stereo[kChannelSamples * 2];
+   int16_t pcm[kChannelSamples * 2];
+@@ -95,12 +95,19 @@ void Ps5AudioDriver::OutputThread() {
+       std::memset(pcm, 0, sizeof(pcm));
+     }
+     if (frame) {
+-      {
+-        std::lock_guard<std::mutex> guard(frames_mutex_);
+-        frames_unused_.push(frame);
+-      }
+-      semaphore_->Release(1, nullptr);
++      std::lock_guard<std::mutex> guard(frames_mutex_);
++      frames_unused_.push(frame);
+     }
++    // [ng2] The semaphore is a credit - "the game may submit one more frame" -
++    // and the audio worker waits on it to call the game's audio callback. It
++    // was returned only when a real frame was played: the first time the game
++    // was late, the queue ran dry, silence played, nothing was returned, and
++    // with no credit left the game was never asked for audio again - all
++    // sound gone for the rest of the run (Ninja Gaiden II A1). An underrun is
++    // exactly when another frame is most wanted, so it returns the credit too.
++    // The semaphore's maximum (the queue depth) bounds the credits, and a
++    // release past it is refused harmlessly.
++    semaphore_->Release(1, nullptr);
+     sceAudioOutOutput(port_, pcm);
+   }
+ }
+diff --git a/src/codegen/builders/context.cpp b/src/codegen/builders/context.cpp
+index f78e0d8f..7a94390b 100644
+--- a/src/codegen/builders/context.cpp
++++ b/src/codegen/builders/context.cpp
+@@ -71,6 +71,12 @@ std::string BuilderContext::f(size_t index) {
+ 
+ std::string BuilderContext::v(size_t index) {
+   const auto& cfg = config();
++  // [ng2] A register named in shared_vector_registers carries a value between
++  // functions, so it must stay in ctx: localising it turns the caller's value
++  // into a zero-initialised local (the garbled-video bug).
++  if (cfg.sharedVectorRegisters.count(static_cast<uint32_t>(index))) {
++    return fmt::format("ctx.v{}", index);
++  }
+   if ((cfg.nonArgumentRegistersAsLocalVariables && (index >= 32 && index <= 63)) ||
+       (localizeNonVolatiles() && ((index >= 14 && index <= 31) || (index >= 64 && index <= 127)))) {
+     locals.v[index] = true;
+diff --git a/src/codegen/builders/system.cpp b/src/codegen/builders/system.cpp
+index b2d70f53..470d995e 100644
+--- a/src/codegen/builders/system.cpp
++++ b/src/codegen/builders/system.cpp
+@@ -49,8 +49,11 @@ bool build_eieio(BuilderContext& ctx) {
+ }
+ 
+ bool build_db16cyc(BuilderContext& ctx) {
+-  // Xenon-specific 16-cycle delay hint, no effect in recompiled code
+-  (void)ctx;
++  // [ng2] Xenon's spin-wait hint: it delays ~16 cycles and hands them to the
++  // sibling hardware thread. Emitting nothing left twelve spin loops in
++  // Ninja Gaiden II burning a core; ppc_db16cyc() pauses, and yields now and
++  // then so a spinning thread cannot starve the one it waits for.
++  ctx.println("\tppc_db16cyc();");
+   return true;
+ }
+ 
+diff --git a/src/codegen/config.cpp b/src/codegen/config.cpp
+index 5da54a0d..dd380289 100644
+--- a/src/codegen/config.cpp
++++ b/src/codegen/config.cpp
+@@ -120,6 +120,20 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
+     cfg.isDll = toml["is_dll"].value_or(false);
+   }
+ 
++  // [ng2] shared_vector_registers = [64, 65, ...]: merged across includes.
++  if (auto* shared = toml["shared_vector_registers"].as_array()) {
++    for (const auto& node : *shared) {
++      auto index = node.value<int64_t>();
++      if (!index || *index < 0 || *index > 127) {
++        REXCODEGEN_ERROR("shared_vector_registers: entries must be integers 0-127");
++        continue;
++      }
++      if (cfg.sharedVectorRegisters.insert(static_cast<uint32_t>(*index)).second) {
++        REXCODEGEN_DEBUG("[config]   shared vector register v{}", *index);
++      }
++    }
++  }
++
+   // Integer scalars (only override if present)
+   if (auto v = toml["longjmp_address"].value<int64_t>()) {
+     uint32_t addr = static_cast<uint32_t>(*v);
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 2bd7a911..c6958e25 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -116,6 +116,12 @@ elseif(ANDROID)  # [svr2011] pthread and rt are part of bionic's libc
+ elseif(UNIX)
+     target_link_libraries(rexcore PRIVATE pthread rt dl)
+ endif()
++# [ng2 ps5 port] rex/ps5_diag.h's symbols for every other platform: shared
++# code calls them unguarded, and the codegen tool for a PS5 build is a host
++# build of this tree.
++if(NOT PS5)
++    target_sources(rexcore PRIVATE ps5_diag_host.cpp)
++endif()
+ 
+ target_link_libraries(rexcore
+     PUBLIC
+diff --git a/src/core/logging.cpp b/src/core/logging.cpp
+index 1645848c..1beb3a32 100644
+--- a/src/core/logging.cpp
++++ b/src/core/logging.cpp
+@@ -72,7 +72,8 @@ LogConfig g_config;
+ 
+ std::filesystem::path NextSequentialLogPath(const std::filesystem::path& logs_dir,
+                                             std::string_view app_name) {
+-  std::filesystem::create_directories(logs_dir);
++  std::error_code mkdir_ec;  // [ng2 ps5 port] (a read-only folder must not throw here)
++  std::filesystem::create_directories(logs_dir, mkdir_ec);
+ 
+   int max_seq = 0;
+   std::string prefix = std::string(app_name) + "_";
+diff --git a/src/core/ps5_diag_host.cpp b/src/core/ps5_diag_host.cpp
+new file mode 100644
+index 00000000..c3b9506a
+--- /dev/null
++++ b/src/core/ps5_diag_host.cpp
+@@ -0,0 +1,30 @@
++// [ng2 ps5 port] rex/ps5_diag.h on every platform but the PS5 (ps5_diag.cpp
++// is FreeBSD-only). Shared code fills the counters and wait slots without a
++// platform guard, so a host build - the codegen tool for a PS5 build is one -
++// needs the symbols. Nothing here reports anything: the monitor that reads
++// them runs on the PS5 only.
++#include <rex/ps5_diag.h>
++
++#include <chrono>
++
++namespace rex::ps5diag {
++std::atomic<uint64_t> counters[kCount];
++WaitSlot wait_slots[kWaitSlots];
++uintptr_t guest_arena_lo = 0, guest_arena_hi = 0;
++void (*crash_hook)(const char* what) = nullptr;
++void (*title_exit_hook)() = nullptr;
++
++WaitSlot* CurrentWaitSlot() { return nullptr; }
++uint64_t NowMs() {
++  return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
++                      std::chrono::steady_clock::now().time_since_epoch())
++                      .count());
++}
++const char* ObjectTypeName(uint32_t) { return "object"; }
++void RegisterThread(const char*) {}
++void SampleAllThreads() {}
++void UnhandledHostFault(uintptr_t, uintptr_t, uintptr_t) {}
++uintptr_t Anchor() { return 0; }
++void NoteCriticalSectionInit(uint32_t, uint32_t) {}
++uint32_t CriticalSectionInitBy(uint32_t) { return 0; }
++}  // namespace rex::ps5diag
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 651a6e46..c1418f4d 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -11,6 +11,8 @@
+ 
+ #include <vector>
+ #include <algorithm>
++#include <atomic>
++#include <chrono>
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
+@@ -37,6 +39,7 @@
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/user_module.h>
+ #include <rex/timeline.h>
++#include <rex/graphics/ng2_phase_timer.h>
+ 
+ REXCVAR_DECLARE(bool, vsync);  // [svr2011] (ui/presenter.cpp: the presenters read it too)
+ 
+@@ -81,6 +84,9 @@ REXCVAR_DEFINE_INT32(query_occlusion_fake_sample_count, 1000, "GPU",
+     .range(1, 100000)
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_BOOL(gpu_phase_timer_details, false, "GPU",
++                    "[ng2 ps5 port] Time the parts of every draw (costs CPU time per draw; diagnostics only)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
+                     "Compile shaders and create pipelines asynchronously in background "
+                     "threads. This reduces stutter but may cause brief visual artifacts while "
+@@ -89,6 +95,46 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
+ 
+ namespace rex::graphics {
+ 
++// [ng2 ps5 port] Time the GPU command thread spends waiting inside the
++// command stream (WAIT_REG_MEM) or for host GPU fences, for the busy line in
++// WorkerThreadMain. The Vulkan backend adds its fence waits.
++std::atomic<int64_t> ng2_command_thread_wait_ns{0};
++
++namespace ng2phase {
++
++namespace {
++int64_t g_last_swap_ns = 0;
++}  // namespace
++
++void EndFrame() {
++  const int64_t now = NowNs();
++  const int64_t frame_ns = g_last_swap_ns ? now - g_last_swap_ns : 0;
++  g_last_swap_ns = now;
++  if (frame_ns > 50'000'000) {
++    // At most one line a second, and 300 in a run, so a bad stretch does not
++    // become the log.
++    static int64_t last_report_ns = 0;
++    static int reports = 0;
++    if (now - last_report_ns > 1'000'000'000 && reports < 300) {
++      last_report_ns = now;
++      ++reports;
++      auto ms = [](int64_t ns) { return double(ns) / 1e6; };
++      REXGPU_INFO(
++          "Slow frame {:.1f} ms: command thread busy {:.1f} (idle {:.1f}: waiting for the game's commands); "
++          "draws {:.1f}, resolves {:.1f}, swap {:.1f}, submit {:.1f}, texture loads {:.1f}, pipelines {:.1f}, "
++          "host GPU waits {:.1f}, game waits {:.1f}",
++          ms(frame_ns), ms(tls_frame_ns[kBusy]), ms(frame_ns - tls_frame_ns[kBusy]), ms(tls_frame_ns[kDraw]),
++          ms(tls_frame_ns[kCopy]), ms(tls_frame_ns[kSwap]), ms(tls_frame_ns[kSubmit]),
++          ms(tls_frame_ns[kTextureLoad]), ms(tls_frame_ns[kPipeline]), ms(tls_frame_ns[kFenceWait]),
++          ms(tls_frame_ns[kRegWait]));
++    }
++  }
++  for (int64_t& v : tls_frame_ns)
++    v = 0;
++}
++
++}  // namespace ng2phase
++
+ using namespace rex::graphics::xenos;
+ 
+ namespace {
+@@ -209,6 +255,8 @@ void CommandProcessor::WorkerThreadMain() {
+     rex::FatalError("Unable to setup command processor internal state");
+     return;
+   }
++  ng2phase::tls_command_thread = true;  // [ng2 ps5 port]
++  ng2phase::g_details = REXCVAR_GET(gpu_phase_timer_details);
+ 
+   while (worker_running_) {
+     while (!pending_fns_.empty()) {
+@@ -247,7 +295,66 @@ void CommandProcessor::WorkerThreadMain() {
+ 
+     // Execute. Note that we handle wraparound transparently.
+     rex::ps5diag::Add(rex::ps5diag::kPrimaryBuffers);
+-    read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
++    const uint32_t epoch = ring_epoch_.load(std::memory_order_acquire);
++    // [ng2 ps5 port] How busy this thread is - executing the game's command
++    // stream versus waiting for more - logged every 10 s: near 1000 ms/s the
++    // emulated GPU's CPU side is the frame-rate limit, well below it the
++    // host GPU (or the game itself) is.
++    ng2phase::g_details = REXCVAR_GET(gpu_phase_timer_details);
++    const auto busy_start = std::chrono::steady_clock::now();
++    const uint32_t new_read_ptr_index = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
++    ng2phase::Add(ng2phase::kBusy, std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                       std::chrono::steady_clock::now() - busy_start)
++                                       .count());
++    {
++      static std::chrono::steady_clock::duration busy{};
++      static auto window_start = busy_start;
++      const auto busy_end = std::chrono::steady_clock::now();
++      busy += busy_end - busy_start;
++      const auto window = busy_end - window_start;
++      if (window >= std::chrono::seconds(10)) {
++        const int64_t window_ms =
++            std::max<int64_t>(1, std::chrono::duration_cast<std::chrono::milliseconds>(window).count());
++        const int64_t busy_ms = std::chrono::duration_cast<std::chrono::milliseconds>(busy).count();
++        const int64_t wait_ms =
++            ng2_command_thread_wait_ns.exchange(0, std::memory_order_relaxed) / 1'000'000;
++        // Busy includes the game's own waits inside its command stream
++        // (WAIT_REG_MEM) and the waits for the host GPU's fences: busy minus
++        // waiting is the CPU work of emulating the GPU.
++        REXGPU_INFO("GPU command thread: busy {} ms/s, of which waiting {} ms/s (game waits + host GPU)",
++                    busy_ms * 1000 / window_ms, wait_ms * 1000 / window_ms);
++        // Where the busy time went, in ms per second (phases nest - see
++        // ng2_phase_timer.h).
++        int64_t per_s[ng2phase::kCount];
++        for (int i = 0; i < ng2phase::kCount; ++i)
++          per_s[i] = ng2phase::g_window_ns[i].exchange(0, std::memory_order_relaxed) / 1000 / window_ms;
++        const uint32_t draws = ng2phase::g_window_draws.exchange(0, std::memory_order_relaxed);
++        const uint32_t async_pipelines = ng2phase::g_window_pipelines_async.exchange(0, std::memory_order_relaxed);
++        REXGPU_INFO(
++            "GPU command thread ms/s: swap {}, submit {}, texture loads {}, pipelines {}, host GPU waits {}, "
++            "game waits {}; {} draws/s; pipelines built off-thread {}",
++            per_s[ng2phase::kSwap], per_s[ng2phase::kSubmit], per_s[ng2phase::kTextureLoad],
++            per_s[ng2phase::kPipeline], per_s[ng2phase::kFenceWait], per_s[ng2phase::kRegWait],
++            int64_t(draws) * 1000 / window_ms, async_pipelines);
++        if (ng2phase::g_details) {  // (per-draw figures: only with the details on)
++          REXGPU_INFO(
++              "GPU command thread ms/s in draws: total {} (resolves {}, primitives {}, textures {}, render "
++              "targets {}, bindings {}, global lock waits {}), {:.2f} us per draw",
++              per_s[ng2phase::kDraw], per_s[ng2phase::kCopy], per_s[ng2phase::kPrimitives],
++              per_s[ng2phase::kTextures], per_s[ng2phase::kRenderTargets], per_s[ng2phase::kBindings],
++              per_s[ng2phase::kLockWait],
++              draws ? double(per_s[ng2phase::kDraw]) * double(window_ms) / double(draws) : 0.0);
++        }
++        busy = {};
++        window_start = busy_end;
++      }
++    }
++    if (ring_epoch_.load(std::memory_order_acquire) != epoch) {
++      // [ng2] The ring was re-initialised while this pass ran: its read
++      // pointer belongs to the ring's previous life.
++      continue;
++    }
++    read_ptr_index_ = new_read_ptr_index;
+ 
+     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
+     //     that many indices.
+@@ -330,7 +437,15 @@ bool CommandProcessor::SetupContext() {
+ void CommandProcessor::ShutdownContext() {}
+ 
+ void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
++  // [ng2] Programming the ring base resets both pointers, as the hardware
++  // does. Resetting only the read pointer let the parser compare a fresh read
++  // pointer with a write pointer from the ring's previous life, read that as
++  // a wrap and execute a whole ring of dead commands: Ninja Gaiden II
++  // re-initialises the ring at every mode change, and froze at the attract
++  // demo (ISSUES_AND_FIXES D12).
++  ring_epoch_.fetch_add(1, std::memory_order_acq_rel);
+   read_ptr_index_ = 0;
++  write_ptr_index_.store(0);
+   primary_buffer_ptr_ = ptr;
+   primary_buffer_size_ = uint32_t(1) << (size_log2 + 3);
+ }
+@@ -1010,7 +1125,11 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
+   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
+ 
+-  IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
++  {
++    ng2phase::Scope phase(ng2phase::kSwap);  // [ng2 ps5 port]
++    IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
++  }
++  ng2phase::EndFrame();
+ 
+   ++counter_;
+   return true;
+@@ -1046,6 +1165,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+   const uint64_t wait_start = log_waits ? rex::chrono::Clock::QueryHostTickCount() : 0;
+   uint32_t polls = 0;
+   const bool trace = rex::timeline::Enabled();
++  const auto wait_t0 = std::chrono::steady_clock::now();  // [ng2 ps5 port] (busy split)
+ 
+   bool matched = false;
+   do {
+@@ -1118,6 +1238,12 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+     }
+   } while (!matched);
+   if (trace && polls > 1) rex::timeline::Record(rex::timeline::kGpuWaitEnd, poll_reg_addr, polls);
++  if (polls > 1) {
++    const int64_t waited_ns =
++        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_t0).count();
++    ng2_command_thread_wait_ns.fetch_add(waited_ns, std::memory_order_relaxed);
++    ng2phase::Add(ng2phase::kRegWait, waited_ns);
++  }
+ 
+   if (log_waits) {
+     struct WaitStats {
+@@ -1478,6 +1604,8 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
+ 
+       bool major_mode_explicit =
+           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
++      ng2phase::Scope phase(ng2phase::kDraw, true);  // [ng2 ps5 port]
++      ng2phase::g_window_draws.fetch_add(1, std::memory_order_relaxed);
+       draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
+                                  is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
+       if (!draw_succeeded) {
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index cdf6d004..9f7c52dd 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -11,6 +11,8 @@
+ 
+ #include <chrono>
+ #include <thread>
++#include <cstdlib>
++#include <rex/ui/display_clock.h>
+ #include <rex/ps5_diag.h>
+ #include <rex/graphics/graphics_system.h>
+ #include <rex/timeline.h>
+@@ -46,6 +48,19 @@ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none,
+ // [svr2011] The guest's vblank rate (its frame clock), Hz; 0 = the video
+ // mode's (vsync off: 1 kHz).
+ REXCVAR_DEFINE_DOUBLE(guest_vblank_hz, 0.0, "GPU", "Guest vblank rate in Hz (0: the video mode's)");
++// [ng2 ps5 port] Guest vblanks on the display's own refresh (when the
++// presenter measures it - the PS5) instead of a free-running timer: the two
++// clocks drift apart, and every drift step is a frame shown twice or not at
++// all - the "60 fps but choppy" moments. Fired a fraction of a refresh after
++// the display's vblank, so a frame finished right after the guest vblank is
++// never handed over exactly at the display's latch (WWE 2K14 recomp, 0053).
++REXCVAR_DEFINE_BOOL(guest_vblank_display_locked, true, "GPU",
++                    "Fire guest vblanks on the display's refresh when it is measured")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_INT32(guest_vblank_display_phase, 50, "GPU",
++                     "Percent of a display refresh after its vblank to fire the guest vblank")
++    .range(0, 95)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
+                     "Store shaders persistently and load them when loading games to avoid "
+                     "runtime spikes and freezes when playing the game not for the first time.");
+@@ -169,6 +184,8 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
+         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
+         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
++        int64_t last_locked_fire = 0;  // [ng2 ps5 port] display-locked vblanks
++        bool locked_logged = false;
+ #if defined(_WIN32)
+         // [svr2011] a high-resolution waitable timer (Windows 10 1803+): the
+         // wait for a vblank sleeps until 0.25 ms before it instead of
+@@ -219,6 +236,42 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+             }
+             continue;
+           }
++          // [ng2 ps5 port] Locked to the display (see guest_vblank_display_locked).
++          if (REXCVAR_GET(vsync) && REXCVAR_GET(guest_vblank_display_locked)) {
++            namespace dc = rex::ui::display_clock;
++            const int64_t period = dc::period_ns.load(std::memory_order_relaxed);
++            const int64_t last_vblank = dc::last_vblank_ns.load(std::memory_order_acquire);
++            const int64_t now = dc::NowNs();
++            const int64_t guest_period = int64_t(1e9 / refresh_rate_hz);
++            if (period && last_vblank && now - last_vblank < 4 * period &&
++                std::llabs(period - guest_period) * 20 < guest_period) {
++              if (!locked_logged) {
++                locked_logged = true;
++                REXGPU_INFO("Guest vblank locked to the display: {:.3f} Hz (guest {:.3f} Hz), "
++                            "{}% of a refresh after it",
++                            1e9 / double(period), refresh_rate_hz,
++                            REXCVAR_GET(guest_vblank_display_phase));
++              }
++              int64_t target = last_vblank + period * REXCVAR_GET(guest_vblank_display_phase) / 100;
++              // The next one not fired yet (a target in the past and unfired
++              // fires at once: late rather than skipped).
++              while (target <= last_locked_fire + period / 2) {
++                target += period;
++              }
++              const int64_t left = target - now;
++              if (left > 400'000) {
++                std::this_thread::sleep_for(std::chrono::nanoseconds(left - 300'000));
++                continue;  // (re-read the display clock after the sleep)
++              }
++              while (dc::NowNs() < target) {
++                rex::thread::MaybeYield();
++              }
++              MarkVblank();
++              last_locked_fire = target;
++              last_frame_time = chrono::Clock::QueryGuestTickCount();  // (the timer resumes from here)
++              continue;
++            }
++          }
+           uint64_t interval_ticks =
+               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
+           while (current_time - last_frame_time >= interval_ticks) {
+diff --git a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+index 9ce3bb4a..f36dea58 100644
+--- a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+@@ -2030,10 +2030,28 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+         }
+ 
+         // Apply the exponent bias from the bits 13:18 of the fetch constant
+-        // word 4.
++        // word 3 (exp_adjust, after the swizzle).
++        //
++        // [ng2 ps5 port] This read word 4, whose bits 12:21 are the LOD bias:
++        // any texture sampled with a LOD bias came back multiplied by a power
++        // of two made from the bias bits - 2^-24 for Ninja Gaiden II's HDR
++        // post-processing (the downsample of the rendered scene, the luminance
++        // chain), so the scene rendered correctly and then went black, on
++        // every Vulkan driver. The DXBC translator reads word 3, as here now.
++        id_vector_temp_.clear();
++        id_vector_temp_.push_back(const_int_0_);
++        id_vector_temp_.push_back(
++            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) >> 2)));
++        id_vector_temp_.push_back(
++            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) & 3)));
++        spv::Id fetch_constant_word_3_signed = builder_->createUnaryOp(
++            spv::OpBitcast, type_int_,
++            builder_->createLoad(builder_->createAccessChain(spv::StorageClassUniform,
++                                                             uniform_fetch_constants_, id_vector_temp_),
++                                 spv::NoPrecision));
+         spv::Id result_exponent_bias = builder_->createBinBuiltinCall(
+             type_float_, ext_inst_glsl_std_450_, GLSLstd450Ldexp, const_float_1_,
+-            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_4_signed,
++            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_3_signed,
+                                   builder_->makeUintConstant(13), builder_->makeUintConstant(6)));
+         {
+           uint32_t result_remaining_components = used_result_nonzero_components;
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index 76f5600c..3736ad1c 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -10,10 +10,12 @@
+  */
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstdint>
+ #include <utility>
+ 
+ #include <rex/assert.h>
++#include <rex/graphics/ng2_phase_timer.h>
+ #include <rex/chrono/clock.h>
+ #include <rex/cvar.h>
+ #include <rex/dbg.h>
+@@ -22,6 +24,7 @@
+ #include <rex/graphics/pipeline/texture/info.h>
+ #include <rex/graphics/pipeline/texture/util.h>
+ #include <rex/graphics/register_file.h>
++#include <rex/graphics/texture_load_hook.h>
+ #include <rex/graphics/xenos.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
+@@ -395,6 +398,27 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
+   pending_range_count_out = 0;
+ 
+   TextureKey texture_key = texture.key();
++  // [ng2] The title's look at the base level before it is uploaded (see
++  // rex/graphics/texture_load_hook.h). Scaled resolves are render output,
++  // not data from memory, and are left out.
++  if (base_outdated && !texture_key.scaled_resolve) {
++    if (GuestTextureLoadHook hook = GetGuestTextureLoadHook()) {
++      GuestTextureLoad load;
++      load.base_address = texture_key.base_page << 12;
++      load.base_size = texture.GetGuestBaseSize();
++      load.width = texture_key.width_minus_1 + 1;
++      load.height = texture_key.height_minus_1 + 1;
++      load.pitch = texture_key.pitch;
++      load.format = uint32_t(texture_key.format);
++      load.endianness = uint32_t(texture_key.endianness);
++      load.tiled = texture_key.tiled;
++      load.dimension = uint32_t(texture_key.dimension);
++      load.depth_or_array_size = texture_key.depth_or_array_size_minus_1 + 1;
++      load.mip_max_level = texture_key.mip_max_level;
++      load.packed_mips = texture_key.packed_mips;
++      hook(load);
++    }
++  }
+   if (base_outdated) {
+     PendingSharedMemoryRange pending_range;
+     pending_range.start = texture_key.base_page << 12;
+@@ -881,6 +905,7 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
+ }
+ 
+ bool TextureCache::LoadTextureData(Texture& texture) {
++  ng2phase::Scope phase(ng2phase::kTextureLoad);  // [ng2 ps5 port]
+   PendingTextureLoad pending_load;
+   PendingSharedMemoryRange pending_ranges[2];
+   size_t pending_range_count = 0;
+@@ -1118,3 +1143,16 @@ void TextureCache::ScaledResolveGlobalWatchCallback(
+ }
+ 
+ }  // namespace rex::graphics
++
++// [ng2] rex/graphics/texture_load_hook.h
++namespace rex::graphics {
++namespace {
++std::atomic<GuestTextureLoadHook> guest_texture_load_hook{nullptr};
++}  // namespace
++void SetGuestTextureLoadHook(GuestTextureLoadHook hook) {
++  guest_texture_load_hook.store(hook, std::memory_order_release);
++}
++GuestTextureLoadHook GetGuestTextureLoadHook() {
++  return guest_texture_load_hook.load(std::memory_order_acquire);
++}
++}  // namespace rex::graphics
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index ec0df7c8..3bd156f1 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -14,6 +14,7 @@
+ #include <utility>
+ 
+ #include <rex/assert.h>
++#include <rex/graphics/ng2_phase_timer.h>
+ #include <rex/bit.h>
+ #include <rex/dbg.h>
+ #include <rex/graphics/shared_memory.h>
+@@ -343,8 +344,11 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+   }
+ 
+   // Some texture or buffer is empty, for example - safe to draw in this case.
+-  std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
+-  merged_ranges.reserve(count);
++  // [ps5 port] A member scratch list (requests come from the command processor
++  // thread, like upload_ranges_), so the per-draw index and vertex buffer
++  // requests allocate nothing (WWE 2K14 Recomp's 0050, BSD-3, PromethenDev).
++  std::vector<std::pair<uint32_t, uint32_t>>& merged_ranges = request_ranges_scratch_;
++  merged_ranges.clear();
+   for (size_t i = 0; i < count; ++i) {
+     uint32_t start = ranges[i].first;
+     uint32_t length = ranges[i].second;
+@@ -362,10 +366,12 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+ 
+   SCOPE_profile_cpu_f("gpu");
+ 
+-  std::sort(merged_ranges.begin(), merged_ranges.end(),
+-            [](const std::pair<uint32_t, uint32_t>& a, const std::pair<uint32_t, uint32_t>& b) {
+-              return a.first < b.first;
+-            });
++  if (merged_ranges.size() > 1) {
++    std::sort(merged_ranges.begin(), merged_ranges.end(),
++              [](const std::pair<uint32_t, uint32_t>& a, const std::pair<uint32_t, uint32_t>& b) {
++                return a.first < b.first;
++              });
++  }
+   size_t merged_write = 0;
+   for (size_t i = 1; i < merged_ranges.size(); ++i) {
+     std::pair<uint32_t, uint32_t>& range_previous = merged_ranges[merged_write];
+@@ -404,7 +410,11 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+     upload_ranges_.emplace_back(page_start, page_count);
+   };
+   {
++    const int64_t lock_start_ns = ng2phase::g_details ? ng2phase::NowNs() : -1;  // [ng2 ps5 port]
+     auto global_lock = global_critical_region_.Acquire();
++    if (lock_start_ns >= 0) {
++      ng2phase::Add(ng2phase::kLockWait, ng2phase::NowNs() - lock_start_ns);
++    }
+     for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
+       uint32_t page_first = range.first >> page_size_log2_;
+       uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 0bbb0267..afb8f0b0 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -11,10 +11,15 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <fstream>
++#include <filesystem>
++#include <atomic>
++#include <chrono>
+ #include <cstdint>
+ #include <cstring>
+ #include <iterator>
+ #include <mutex>
++#include <set>
+ #include <string>
+ #include <string_view>
+ #include <tuple>
+@@ -24,7 +29,9 @@
+ #include <SPIRV/GlslangToSpv.h>
+ #include <glslang/Public/ShaderLang.h>
+ #include <rex/assert.h>
++#include <rex/graphics/ng2_phase_timer.h>
+ #include <rex/cvar.h>
++#include <rex/filesystem.h>
+ #include <rex/external_frame.h>
+ #include <rex/dbg.h>
+ #include <rex/logging.h>
+@@ -48,6 +55,9 @@
+ #include <rex/ui/vulkan/util.h>
+ 
+ // Legacy backend compatibility aliases for shared readback controls.
++REXCVAR_DEFINE_BOOL(ng2_remove_screen_flash, false, "GPU/Vulkan",
++                    "[ng2 ps5 port] Skip the full-screen white flash some moves draw (the Flying Swallow's)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
+                     "Read render-to-texture results on the CPU")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+@@ -56,6 +66,24 @@ REXCVAR_DEFINE_BOOL(vulkan_readback_memexport, false, "GPU/Vulkan",
+                     "Read data written by memory export in shaders on the CPU")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++// [ng2 ps5 port] Frame reports: for a few frames, every resolve's destination
++// is copied back from the GPU's copy of guest memory and written to a file,
++// with its format, so the images the game renders (the scene before the HUD,
++// the post passes, the front buffer) can be looked at offline - on a console
++// that cannot be watched while debugging. ps5/tools/decode_frame_report.py
++// turns them into PNGs. Unscaled (1x) resolves only.
++REXCVAR_DEFINE_BOOL(frame_report_now, false, "GPU/Vulkan",
++                    "Capture a frame report at the next swap (resets itself)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_INT32(frame_report_after_seconds, 0, "GPU/Vulkan",
++                     "Capture one frame report this many seconds after the first swap (0: off)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_INT32(frame_report_frames, 2, "GPU/Vulkan", "Frames in each frame report")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_STRING(frame_report_path, "", "GPU/Vulkan",
++                      "Folder for frame reports (empty: logs/frame_reports beside the executable)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
+                     "When async shader compilation is enabled, skip presenting frames that "
+                     "used placeholder pipelines to avoid visible flashing")
+@@ -70,10 +98,33 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
+                     "device (falls back to render passes otherwise)")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++namespace rex::graphics {
++extern std::atomic<int64_t> ng2_command_thread_wait_ns;  // [ng2 ps5 port] command_processor.cpp
++}  // namespace rex::graphics
++
+ namespace rex::graphics::vulkan {
+ 
+ namespace {
+ 
++// [ps5 port] Copies the float constants a shader uses, one memcpy per run of
++// consecutive constants instead of one per constant; the same bytes in the
++// same order (WWE 2K14 Recomp's 0041, BSD-3, PromethenDev).
++void CopyFloatConstantMapEntry(uint8_t*& mapping, const uint32_t* regs, uint64_t float_constant_map_entry) {
++  uint32_t float_constant_index;
++  while (rex::bit_scan_forward(float_constant_map_entry, &float_constant_index)) {
++    const uint64_t run_start_bits = float_constant_map_entry >> float_constant_index;
++    uint32_t run_length;
++    if (!rex::bit_scan_forward(~run_start_bits, &run_length)) {
++      run_length = 64 - float_constant_index;
++    }
++    const size_t run_bytes = size_t(run_length) * sizeof(float) * 4;
++    std::memcpy(mapping, &regs[float_constant_index * 4], run_bytes);
++    mapping += run_bytes;
++    const uint64_t run_mask = run_length == 64 ? ~uint64_t(0) : (UINT64_C(1) << run_length) - 1;
++    float_constant_map_entry &= ~(run_mask << float_constant_index);
++  }
++}
++
+ // glslang default built-in resource limits.
+ constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
+     /* .maxLights = */ 32,
+@@ -3665,6 +3716,175 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
+   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
+ }
+ 
++// [ng2 ps5 port] Frame reports (see frame_report_now).
++namespace {
++// Frame report state (GPU thread only).
++struct FrameReport {
++  int frames_left = 0;     // > 0 while capturing
++  int report_index = 0;
++  uint32_t frame = 0;      // within the report
++  uint32_t resolves = 0;
++  std::string folder;
++  std::chrono::steady_clock::time_point first_swap{};
++  bool timed_done = false;
++  std::ofstream sequence;  // draws.txt: every draw and resolve, in order
++  uint32_t draws = 0;
++};
++FrameReport g_report;
++
++// At each swap: start a report when asked for, and count its frames down.
++void FrameReportSwap() {
++  const auto now = std::chrono::steady_clock::now();
++  if (g_report.first_swap == std::chrono::steady_clock::time_point{}) {
++    g_report.first_swap = now;
++  }
++  if (g_report.frames_left > 0) {
++    ++g_report.frame;
++    if (--g_report.frames_left == 0) {
++      g_report.sequence.close();
++      REXGPU_INFO("[frame report] {} written ({} resolves, {} draws)", g_report.folder, g_report.resolves,
++                  g_report.draws);
++    }
++    return;
++  }
++  bool start = false;
++  if (REXCVAR_GET(frame_report_now)) {
++    rex::cvar::SetFlagByName("frame_report_now", "false");
++    start = true;
++  }
++  const int after = REXCVAR_GET(frame_report_after_seconds);
++  if (!g_report.timed_done && after > 0 && now - g_report.first_swap >= std::chrono::seconds(after)) {
++    g_report.timed_done = true;
++    start = true;
++  }
++  if (!start) {
++    return;
++  }
++  ++g_report.report_index;
++  // Absolute, beside the executable (/app0 on the PS5) unless set: the
++  // working directory is not reliably the app's folder.
++  std::string root = REXCVAR_GET(frame_report_path);
++  if (root.empty()) {
++    root = (rex::filesystem::GetExecutableFolder() / "logs" / "frame_reports").string();
++  }
++  g_report.folder = fmt::format("{}/{:03}", root, g_report.report_index);
++  std::error_code ec;
++  std::filesystem::create_directories(g_report.folder, ec);
++  if (ec) {
++    REXGPU_ERROR("[frame report] cannot create {}: {}", g_report.folder, ec.message());
++  }
++  g_report.frames_left = std::max(1, REXCVAR_GET(frame_report_frames));
++  g_report.frame = 0;
++  g_report.resolves = 0;
++  g_report.draws = 0;
++  g_report.sequence.close();
++  g_report.sequence.open(g_report.folder + "/draws.txt", std::ios::trunc);
++  REXGPU_INFO("[frame report] capturing {} frame(s) into {}", g_report.frames_left, g_report.folder);
++}
++
++// One draw of a frame report: its render target and every texture its shaders
++// fetch, so a pass that samples a resolved image can be matched to the resolve.
++void FrameReportDraw(const RegisterFile& regs, const VulkanShader* vertex_shader,
++                     const VulkanShader* pixel_shader) {
++  if (g_report.frames_left <= 0 || !g_report.sequence.is_open() || g_report.draws >= 6000) {
++    return;
++  }
++  const uint32_t n = g_report.draws++;
++  const auto surface = regs.Get<reg::RB_SURFACE_INFO>();
++  const auto color0 = regs.Get<reg::RB_COLOR_INFO>();
++  const auto depth = regs.Get<reg::RB_DEPTH_INFO>();
++  std::string line = fmt::format(
++      "draw {} frame {} vs {:016X} ps {:016X} rt pitch {} msaa {} color0 base {} format {} mask {:04X} "
++      "depth base {} format {} edram_mode {}",
++      n, g_report.frame, vertex_shader ? vertex_shader->ucode_data_hash() : 0,
++      pixel_shader ? pixel_shader->ucode_data_hash() : 0, uint32_t(surface.surface_pitch),
++      uint32_t(surface.msaa_samples), uint32_t(color0.color_base), uint32_t(color0.color_format),
++      regs.Get<reg::RB_COLOR_MASK>().value & 0xFFFF, uint32_t(depth.depth_base),
++      uint32_t(depth.depth_format), uint32_t(regs.Get<reg::RB_MODECONTROL>().edram_mode));
++  uint32_t seen = 0;
++  for (const VulkanShader* shader : {vertex_shader, pixel_shader}) {
++    if (!shader) continue;
++    for (const auto& binding : shader->GetTextureBindingsAfterTranslation()) {
++      const uint32_t fc = binding.fetch_constant;
++      if (seen & (1u << fc)) continue;
++      seen |= 1u << fc;
++      const auto fetch = regs.GetTextureFetch(fc);
++      uint32_t w = 0, h = 0;
++      switch (fetch.dimension) {
++        case xenos::DataDimension::k1D: w = fetch.size_1d.width + 1, h = 1; break;
++        case xenos::DataDimension::k3D: w = fetch.size_3d.width + 1, h = fetch.size_3d.height + 1; break;
++        default: w = fetch.size_2d.width + 1, h = fetch.size_2d.height + 1; break;
++      }
++      line += fmt::format(" | tex{} {:08X} fmt {} {}x{} dim {} endian {} tiled {} pitch {} exp {} "
++                          "signs {}{}{}{} swz {:03X} type {}",
++                          fc, uint32_t(fetch.base_address) << 12, uint32_t(fetch.format), w, h,
++                          uint32_t(fetch.dimension), uint32_t(fetch.endianness), uint32_t(fetch.tiled),
++                          uint32_t(fetch.pitch), int32_t(fetch.exp_adjust), uint32_t(fetch.sign_x),
++                          uint32_t(fetch.sign_y), uint32_t(fetch.sign_z), uint32_t(fetch.sign_w),
++                          uint32_t(fetch.swizzle), uint32_t(fetch.type));
++    }
++  }
++  g_report.sequence << line << "\n";
++}
++
++}  // namespace
++
++// [ng2 ps5 port] A screen flash: a full-screen overlay of a few vertices,
++// blended over what is there, drawn by a pixel shader that samples nothing and
++// whose first constant is near white. The game draws its flash (the Flying
++// Swallow's) this way; a fade to black or a dimmed menu backdrop is not near
++// white and a textured overlay samples something, so they are left alone.
++// Each distinct candidate is logged once, flash or not, so a flash drawn some
++// other way can be identified from a log.
++bool VulkanCommandProcessor::IsScreenFlashDraw(const VulkanShader& pixel_shader,
++                                               const PrimitiveProcessor::ProcessingResult& primitives) {
++  const RegisterFile& regs = *register_file_;
++  if (primitives.host_draw_vertex_count > 6 || pixel_shader.GetUsedTextureMaskAfterTranslation()) {
++    return false;
++  }
++  const auto blend = regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[0]);
++  if (blend.color_srcblend == xenos::BlendFactor::kOne && blend.color_destblend == xenos::BlendFactor::kZero) {
++    return false;  // replaces the picture: not an overlay
++  }
++  const auto tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
++  const auto br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
++  if (br.br_x < tl.tl_x + 1200 || br.br_y < tl.tl_y + 680) {
++    return false;  // not the whole 1280x720 screen
++  }
++  const auto& map = pixel_shader.constant_register_map().float_bitmap;
++  uint32_t first = UINT32_MAX;
++  for (uint32_t i = 0; i < 4 && first == UINT32_MAX; ++i) {
++    uint32_t bit;
++    if (rex::bit_scan_forward(map[i], &bit)) {
++      first = i * 64 + bit;
++    }
++  }
++  if (first == UINT32_MAX) {
++    return false;
++  }
++  float c[4];
++  std::memcpy(c, &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + first * 4], sizeof(c));
++  const bool white = c[0] >= 0.6f && c[1] >= 0.6f && c[2] >= 0.6f && c[3] > 0.02f;
++  static std::mutex logged_mutex;
++  static std::set<uint64_t> logged;
++  {
++    std::lock_guard lock(logged_mutex);
++    if (logged.insert(pixel_shader.ucode_data_hash() ^ (uint64_t(white) << 63)).second && logged.size() < 64) {
++      REXGPU_INFO("Screen overlay candidate: PS {:016X}, blend {:08X}, c{} = ({:.2f}, {:.2f}, {:.2f}, {:.2f}){}",
++                  pixel_shader.ucode_data_hash(), blend.value, first, c[0], c[1], c[2], c[3],
++                  white ? " - a flash" : "");
++    }
++  }
++  if (!white || !REXCVAR_GET(ng2_remove_screen_flash)) {
++    return false;
++  }
++  static std::atomic<int> removed{0};
++  if (removed.fetch_add(1, std::memory_order_relaxed) < 5) {
++    REXGPU_INFO("Screen flash removed (PS {:016X})", pixel_shader.ucode_data_hash());
++  }
++  return true;
++}
++
+ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
+                                        IndexBufferInfo* index_buffer_info,
+                                        bool major_mode_explicit) {
+@@ -3691,6 +3911,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
+   if (edram_mode == xenos::EdramMode::kCopy) {
+     // Special copy handling.
++    ng2phase::Scope phase(ng2phase::kCopy, true);  // [ng2 ps5 port]
+     return IssueCopy();
+   }
+ 
+@@ -3798,7 +4019,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     }
+ 
+     // Process primitives.
+-    if (!primitive_processor_->Process(primitive_processing_result)) {
++    bool primitives_ok;
++    {
++      ng2phase::Scope phase(ng2phase::kPrimitives, true);  // [ng2 ps5 port]
++      primitives_ok = primitive_processor_->Process(primitive_processing_result);
++    }
++    if (!primitives_ok) {
+       return draw_fail("primitive_processing");
+     }
+     if (!primitive_processing_result.host_draw_vertex_count) {
+@@ -3919,18 +4145,32 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+       pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
+                    : 0;
+ 
++  // [ng2 ps5 port] The white screen flash some moves draw (the Flying
++  // Swallow's, as on the Xbox 360) as an option the player can turn off.
++  if (pixel_shader && normalized_color_mask && IsScreenFlashDraw(*pixel_shader, primitive_processing_result)) {
++    return true;
++  }
++
+   // Update the textures before most other work in the submission because
+   // samplers depend on this (and in case of sampler overflow in a submission,
+   // submissions must be split) - may perform dispatches and copying.
+   uint32_t used_texture_mask =
+       vertex_shader->GetUsedTextureMaskAfterTranslation() |
+       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
+-  texture_cache_->RequestTextures(used_texture_mask);
++  {
++    ng2phase::Scope phase(ng2phase::kTextures, true);  // [ng2 ps5 port]
++    texture_cache_->RequestTextures(used_texture_mask);
++  }
+ 
+   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
+   // Set up the render targets - this may perform dispatches and draws.
+-  if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
+-                                    normalized_color_mask, *vertex_shader)) {
++  bool render_targets_ok;
++  {
++    ng2phase::Scope phase(ng2phase::kRenderTargets, true);  // [ng2 ps5 port]
++    render_targets_ok = render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
++                                                     normalized_color_mask, *vertex_shader);
++  }
++  if (!render_targets_ok) {
+     return draw_fail("render_target_update");
+   }
+ 
+@@ -4063,7 +4303,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+ 
+   // Update uniform buffers and descriptor sets after binding the pipeline with
+   // the new layout.
+-  if (!UpdateBindings(vertex_shader, pixel_shader)) {
++  bool bindings_ok;
++  {
++    ng2phase::Scope phase(ng2phase::kBindings, true);  // [ng2 ps5 port]
++    bindings_ok = UpdateBindings(vertex_shader, pixel_shader);
++  }
++  if (!bindings_ok) {
+     return draw_fail("update_bindings");
+   }
+ 
+@@ -4271,6 +4516,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     }
+   }
+ 
++  FrameReportDraw(regs, vertex_shader, pixel_shader);  // [ng2 ps5 port]
+   return true;
+ }
+ 
+@@ -4471,6 +4717,128 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
+   return true;
+ }
+ 
++// [ng2 ps5 port] One resolve of a frame report (see frame_report_now): the
++// destination bytes from the GPU's copy of guest memory, waited for, written
++// with the registers that say how to read them.
++void VulkanCommandProcessor::FrameReportResolve(uint32_t written_address, uint32_t written_length) {
++  const auto& regs = *register_file_;
++  const auto copy_control = regs.Get<reg::RB_COPY_CONTROL>();
++  const auto dest_info = regs.Get<reg::RB_COPY_DEST_INFO>();
++  const auto dest_pitch = regs.Get<reg::RB_COPY_DEST_PITCH>();
++  const uint32_t dest_base = regs[XE_GPU_REG_RB_COPY_DEST_BASE];
++  const auto surface = regs.Get<reg::RB_SURFACE_INFO>();
++  const uint32_t src = copy_control.copy_src_select;
++  uint32_t src_format = 0;
++  if (src >= 4) {
++    src_format = uint32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_format) | 0x100;  // depth
++  } else {
++    static const uint32_t kColorInfo[] = {XE_GPU_REG_RB_COLOR_INFO, XE_GPU_REG_RB_COLOR1_INFO,
++                                          XE_GPU_REG_RB_COLOR2_INFO, XE_GPU_REG_RB_COLOR3_INFO};
++    src_format = uint32_t(reg::RB_COLOR_INFO{regs[kColorInfo[src]]}.color_format);
++  }
++  const uint32_t seq = g_report.resolves++;
++  const uint32_t src_base = src >= 4 ? uint32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_base)
++                                     : (src == 0 ? uint32_t(regs.Get<reg::RB_COLOR_INFO>().color_base) : 0);
++  // The EDRAM itself for the first resolves (fragment shader interlock keeps
++  // it in a buffer): shows whether the draws wrote anything before the copy.
++  const bool dump_edram = seq < 16 && render_target_cache_->GetPath() ==
++                                          RenderTargetCache::Path::kPixelShaderInterlock;
++  std::string line = fmt::format(
++      "{} frame {} written {:08X}+{:X} dest_base {:08X} dest_format {} dest_endian {} "
++      "dest_number {} dest_swap {} dest_exp_bias {} pitch {} height {} src {} src_format {:X} "
++      "surface_pitch {} msaa {} color_clear {} depth_clear {} src_base {}",
++      seq, g_report.frame, written_address, written_length, dest_base,
++      uint32_t(dest_info.copy_dest_format), uint32_t(dest_info.copy_dest_endian),
++      uint32_t(dest_info.copy_dest_number), uint32_t(dest_info.copy_dest_swap),
++      int32_t(dest_info.copy_dest_exp_bias), uint32_t(dest_pitch.copy_dest_pitch),
++      uint32_t(dest_pitch.copy_dest_height), src, src_format, uint32_t(surface.surface_pitch),
++      uint32_t(surface.msaa_samples), uint32_t(copy_control.color_clear_enable),
++      uint32_t(copy_control.depth_clear_enable), src_base);
++  if (texture_cache_->IsDrawResolutionScaled()) {
++    line += " (scaled: not captured - use 720p)";
++  } else if (written_length <= (64u << 20)) {
++    const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
++    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++    const VkDevice device = vulkan_device->device();
++    VkBuffer buffer = VK_NULL_HANDLE;
++    VkDeviceMemory memory = VK_NULL_HANDLE;
++    void* mapping = nullptr;
++    VkBuffer edram_copy = VK_NULL_HANDLE;
++    VkDeviceMemory edram_memory = VK_NULL_HANDLE;
++    void* edram_mapping = nullptr;
++    if (dump_edram &&
++        (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
++             vulkan_device, xenos::kEdramSizeBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++             ui::vulkan::util::MemoryPurpose::kReadback, edram_copy, edram_memory) ||
++         dfn.vkMapMemory(device, edram_memory, 0, VK_WHOLE_SIZE, 0, &edram_mapping) != VK_SUCCESS)) {
++      edram_mapping = nullptr;
++    }
++    if (ui::vulkan::util::CreateDedicatedAllocationBuffer(
++            vulkan_device, written_length, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++            ui::vulkan::util::MemoryPurpose::kReadback, buffer, memory) &&
++        dfn.vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, &mapping) == VK_SUCCESS) {
++      shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
++      SubmitBarriers(true);
++      VkBufferCopy region = {};
++      region.srcOffset = written_address;
++      region.size = written_length;
++      deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(), buffer, 1, &region);
++      PushBufferMemoryBarrier(buffer, 0, written_length, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                              VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++                              VK_ACCESS_HOST_READ_BIT);
++      if (edram_mapping) {
++        render_target_cache_->UseEdramBufferForTransferRead();
++        SubmitBarriers(true);
++        VkBufferCopy edram_region = {};
++        edram_region.size = xenos::kEdramSizeBytes;
++        deferred_command_buffer_.CmdVkCopyBuffer(render_target_cache_->edram_buffer(), edram_copy, 1,
++                                                 &edram_region);
++        PushBufferMemoryBarrier(edram_copy, 0, xenos::kEdramSizeBytes, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                                VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++                                VK_ACCESS_HOST_READ_BIT);
++      }
++      if (AwaitAllQueueOperationsCompletion()) {
++        VkMappedMemoryRange range = {};
++        range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
++        range.memory = memory;
++        range.size = VK_WHOLE_SIZE;
++        dfn.vkInvalidateMappedMemoryRanges(device, 1, &range);
++        std::ofstream out(fmt::format("{}/res_{:04}.bin", g_report.folder, seq), std::ios::binary);
++        out.write(static_cast<const char*>(mapping), std::streamsize(written_length));
++        if (!out) {
++          REXGPU_ERROR("[frame report] cannot write {}/res_{:04}.bin", g_report.folder, seq);
++          line += " (write failed)";
++        }
++        if (edram_mapping) {
++          range.memory = edram_memory;
++          dfn.vkInvalidateMappedMemoryRanges(device, 1, &range);
++          std::ofstream edram(fmt::format("{}/edram_{:04}.bin", g_report.folder, seq), std::ios::binary);
++          edram.write(static_cast<const char*>(edram_mapping), std::streamsize(xenos::kEdramSizeBytes));
++          line += " edram dumped";
++        }
++      } else {
++        line += " (wait failed)";
++      }
++      dfn.vkUnmapMemory(device, memory);
++    } else {
++      line += " (no readback buffer)";
++    }
++    if (buffer != VK_NULL_HANDLE) dfn.vkDestroyBuffer(device, buffer, nullptr);
++    if (memory != VK_NULL_HANDLE) dfn.vkFreeMemory(device, memory, nullptr);
++    if (edram_mapping) dfn.vkUnmapMemory(device, edram_memory);
++    if (edram_copy != VK_NULL_HANDLE) dfn.vkDestroyBuffer(device, edram_copy, nullptr);
++    if (edram_memory != VK_NULL_HANDLE) dfn.vkFreeMemory(device, edram_memory, nullptr);
++  }
++  std::ofstream index(g_report.folder + "/index.txt", std::ios::app);
++  index << line << "\n";
++  if (g_report.sequence.is_open()) {
++    g_report.sequence << "resolve " << line << "\n";
++  }
++  if (!index) {
++    REXGPU_ERROR("[frame report] cannot write {}/index.txt", g_report.folder);
++  }
++}
++
+ bool VulkanCommandProcessor::IssueCopy() {
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+@@ -4485,9 +4853,13 @@ bool VulkanCommandProcessor::IssueCopy() {
+ 
+   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
+   if (readback_mode == ReadbackResolveMode::kDisabled) {
+-    uint32_t written_address, written_length;
+-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+-                                         written_address, written_length);
++    uint32_t written_address = 0, written_length = 0;
++    const bool resolved = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
++                                                        written_address, written_length);
++    if (resolved && written_length && g_report.frames_left > 0) {  // [ng2 ps5 port]
++      FrameReportResolve(written_address, written_length);
++    }
++    return resolved;
+   }
+ 
+   return IssueCopy_ReadbackResolvePath();
+@@ -5063,9 +5435,17 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+     // defined by vkQueueSubmit additionally include in the first
+     // synchronization scope all commands that occur earlier in submission
+     // order."
++    const auto fence_wait_t0 = std::chrono::steady_clock::now();
+     VkResult wait_result =
+         dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
+                             submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
++    {  // [ng2 ps5 port] (busy split)
++      const int64_t waited_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                    std::chrono::steady_clock::now() - fence_wait_t0)
++                                    .count();
++      rex::graphics::ng2_command_thread_wait_ns.fetch_add(waited_ns, std::memory_order_relaxed);
++      ng2phase::Add(ng2phase::kFenceWait, waited_ns);
++    }
+     if (wait_result == VK_SUCCESS) {
+       fences_awaited += await_submission - submission_completed_;
+     } else {
+@@ -5323,6 +5703,10 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+ }
+ 
+ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
++  ng2phase::Scope phase(ng2phase::kSubmit);  // [ng2 ps5 port]
++  if (is_swap) {
++    FrameReportSwap();  // [ng2 ps5 port]
++  }
+   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+@@ -6552,16 +6936,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+       }
+       buffer_info.range = VkDeviceSize(float_constants_size);
+       for (uint32_t i = 0; i < 4; ++i) {
+-        uint64_t float_constant_map_entry = current_float_constant_map_vertex_[i];
+-        uint32_t float_constant_index;
+-        while (rex::bit_scan_forward(float_constant_map_entry, &float_constant_index)) {
+-          float_constant_map_entry &= ~(1ull << float_constant_index);
+-          std::memcpy(
+-              mapping,
+-              &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (i << 8) + (float_constant_index << 2)],
+-              sizeof(float) * 4);
+-          mapping += sizeof(float) * 4;
+-        }
++        CopyFloatConstantMapEntry(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (i << 8)],
++                                  current_float_constant_map_vertex_[i]);
+       }
+       current_constant_buffers_up_to_date_ |= UINT32_C(1)
+                                               << SpirvShaderTranslator::kConstantBufferFloatVertex;
+@@ -6581,16 +6957,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+       }
+       buffer_info.range = VkDeviceSize(float_constants_size);
+       for (uint32_t i = 0; i < 4; ++i) {
+-        uint64_t float_constant_map_entry = current_float_constant_map_pixel_[i];
+-        uint32_t float_constant_index;
+-        while (rex::bit_scan_forward(float_constant_map_entry, &float_constant_index)) {
+-          float_constant_map_entry &= ~(1ull << float_constant_index);
+-          std::memcpy(
+-              mapping,
+-              &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (i << 8) + (float_constant_index << 2)],
+-              sizeof(float) * 4);
+-          mapping += sizeof(float) * 4;
+-        }
++        CopyFloatConstantMapEntry(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (i << 8)],
++                                  current_float_constant_map_pixel_[i]);
+       }
+       current_constant_buffers_up_to_date_ |= UINT32_C(1)
+                                               << SpirvShaderTranslator::kConstantBufferFloatPixel;
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 91ac08f6..773af940 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -24,6 +24,7 @@
+ #include <fmt/format.h>
+ 
+ #include <rex/assert.h>
++#include <rex/graphics/ng2_phase_timer.h>
+ #include <rex/cvar.h>
+ #include <rex/dbg.h>
+ #include <rex/filesystem.h>
+@@ -702,6 +703,16 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+            pipeline_storage_file_);
+   }
+ 
++  // [ng2 ps5 port] C requires a positioning call between reading and writing
++  // an update stream unless the read hit end-of-file. The loaders stop exactly
++  // at the last record (no EOF), so a strict C library fails every later
++  // append silently and the storage never grows past its first session - on
++  // the PS5 it stayed at 95 pipelines while ~145 were built again every run,
++  // each burst a hitch. Seek both streams to the end before the writer starts.
++  // (The fix is WWE 2K14 Recomp's, PromethenDev, BSD-3: rexglue-patches 0037.)
++  rex::filesystem::Seek(pipeline_storage_file_, 0, SEEK_END);
++  rex::filesystem::Seek(shader_storage_file_, 0, SEEK_END);
++
+   shader_storage_cache_root_ = cache_root;
+   shader_storage_title_id_ = title_id;
+ 
+@@ -3480,8 +3491,14 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+   VkPipeline pipeline;
++  const int64_t create_start_ns = ng2phase::NowNs();  // [ng2 ps5 port]
+   VkResult create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
+                                                          &pipeline_create_info, nullptr, &pipeline);
++  if (ng2phase::tls_command_thread) {
++    ng2phase::Add(ng2phase::kPipeline, ng2phase::NowNs() - create_start_ns);
++  } else {
++    ng2phase::g_window_pipelines_async.fetch_add(1, std::memory_order_relaxed);
++  }
+   if (create_result != VK_SUCCESS) {
+     uint64_t ps_hash = creation_arguments.pixel_shader
+                            ? creation_arguments.pixel_shader->shader().ucode_data_hash()
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+index cf9a92ad..f479d9b0 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+@@ -45,7 +45,8 @@ constexpr double kDisplayGammaPower = 2.22222233;
+ 
+ uint32_t GetConfiguredVideoModeWidth() {
+   int32_t configured_width = REXCVAR_GET(video_mode_width);
+-  if (!rex::cvar::HasNonDefaultValue("video_mode_width")) {
++  if (!REXCVAR_GET(video_mode_explicit) &&  // [ng2 D7]
++      !rex::cvar::HasNonDefaultValue("video_mode_width")) {
+     if (rex::cvar::HasNonDefaultValue("window_width") && REXCVAR_GET(window_width) > 0) {
+       configured_width = REXCVAR_GET(window_width);
+     } else {
+@@ -62,7 +63,8 @@ uint32_t GetConfiguredVideoModeWidth() {
+ 
+ uint32_t GetConfiguredVideoModeHeight() {
+   int32_t configured_height = REXCVAR_GET(video_mode_height);
+-  if (!rex::cvar::HasNonDefaultValue("video_mode_height")) {
++  if (!REXCVAR_GET(video_mode_explicit) &&  // [ng2 D7]
++      !rex::cvar::HasNonDefaultValue("video_mode_height")) {
+     if (rex::cvar::HasNonDefaultValue("window_height") && REXCVAR_GET(window_height) > 0) {
+       configured_height = REXCVAR_GET(window_height);
+     } else {
+diff --git a/src/system/user_module.cpp b/src/system/user_module.cpp
+index 171546fb..16ca9b52 100644
+--- a/src/system/user_module.cpp
++++ b/src/system/user_module.cpp
+@@ -63,13 +63,16 @@ X_STATUS UserModule::LoadFromFile(const std::string_view path) {
+   name_ = rex::string::utf8_find_base_name_from_guest_path(path_);
+ 
+   // If the FS supports mapping, map the file in and load from that.
++  // [ng2 ps5 port] Some PS5 mounts (an installed app's sandbox, USB drives)
++  // refuse to map files: read the file instead of failing the load.
++  std::unique_ptr<memory::MappedMemory> mmap;
+   if (fs_entry->can_map()) {
+-    // Map.
+-    auto mmap = fs_entry->OpenMapped(memory::MappedMemory::Mode::kRead);
++    mmap = fs_entry->OpenMapped(memory::MappedMemory::Mode::kRead);
+     if (!mmap) {
+-      return result;
++      REXSYS_WARN("UserModule: cannot map {}; reading it instead", path);
+     }
+-
++  }
++  if (mmap) {
+     // Load the module.
+     result = LoadFromMemory(mmap->data(), mmap->size());
+   } else {
+@@ -79,6 +82,7 @@ X_STATUS UserModule::LoadFromFile(const std::string_view path) {
+     rex::filesystem::File* file = nullptr;
+     result = fs_entry->Open(rex::filesystem::FileAccess::kGenericRead, &file);
+     if (XFAILED(result)) {
++      REXSYS_ERROR("UserModule: cannot open {}: {:08X}", path, result);
+       return result;
+     }
+ 
+@@ -87,6 +91,8 @@ X_STATUS UserModule::LoadFromFile(const std::string_view path) {
+     size_t bytes_read = 0;
+     result = file->ReadSync(std::span<uint8_t>(buffer), 0, &bytes_read);
+     if (XFAILED(result)) {
++      REXSYS_ERROR("UserModule: cannot read {}: {:08X}", path, result);
++      file->Destroy();
+       return result;
+     }
+ 
+@@ -99,6 +105,10 @@ X_STATUS UserModule::LoadFromFile(const std::string_view path) {
+ 
+   // Only XEX returns X_STATUS_PENDING
+   if (result != X_STATUS_PENDING) {
++    if (XFAILED(result)) {  // [ng2 ps5 port] say which file, not just the status
++      REXSYS_ERROR("UserModule: {} ({} bytes{}) did not load: {:08X}", path, fs_entry->size(),
++                   mmap ? ", mapped" : ", read", result);
++    }
+     return result;
+   }
+ 
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 7a3cd053..41174dfd 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -16,6 +16,7 @@
+ #include <rex/system/thread_state.h>
+ #endif
+ #include <algorithm>
++#include <atomic>
+ #include <cstring>
+ #include <utility>
+ 
+@@ -726,10 +727,23 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
+           reinterpret_cast<uintptr_t>(host_address) & ~(uintptr_t(host_page_size - 1));
+       if (rex::memory::Protect(reinterpret_cast<void*>(page_base), host_page_size,
+                                rex::memory::PageAccess::kReadWrite, nullptr)) {
+-        REXSYS_WARN(
+-            "Recovered stale physical page protection for guest {:08X} (host {:016X}, "
+-            "guest_protect {:08X})",
+-            virtual_address, static_cast<uint64_t>(page_base), guest_protect);
++        // [ng2 ps5 port] This runs inside the fault handler with the global
++        // lock held, ~50 times a second in NG2 (a 16 KB host page shared with
++        // a watched 4 KB guest page). As a warning every one forced a log flush
++        // to the drive under that lock - stalling the game thread that faulted
++        // and the GPU thread waiting for the lock. The first few as warnings,
++        // then a count now and then, at info (no forced flush).
++        static std::atomic<uint64_t> recovered{0};
++        const uint64_t n = recovered.fetch_add(1, std::memory_order_relaxed) + 1;
++        if (n <= 3) {
++          REXSYS_WARN(
++              "Recovered stale physical page protection for guest {:08X} (host {:016X}, "
++              "guest_protect {:08X})",
++              virtual_address, static_cast<uint64_t>(page_base), guest_protect);
++        } else if (n % 2000 == 0) {
++          REXSYS_INFO("Recovered stale physical page protection {} times (latest guest {:08X})", n,
++                      virtual_address);
++        }
+         return true;
+       }
+     }
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index 6f1e89ff..f571c271 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <rex/rex_app.h>
+ 
++#include <cstdio>
+ #include <cstdlib>
+ 
+ #include <rex/assert.h>
+@@ -176,6 +177,23 @@ bool ReXApp::SetupEnvironment() {
+   if (log_file_cvar.empty()) {
+     log_config.app_name = std::string(GetName());
+     log_config.log_dir = (exe_dir / "logs").string();
++#if REX_PLATFORM_PS5
++    // [ng2 ps5 port] A read-only app folder: log to /data/ng2recomp/logs
++    // (where the app's other writes go then too, ps5_paths.cpp).
++    {
++      std::error_code ec;
++      std::filesystem::create_directories(log_config.log_dir, ec);
++      const auto probe = std::filesystem::path(log_config.log_dir) / ".write_test";
++      FILE* f = std::fopen(probe.c_str(), "wb");
++      if (f) {
++        std::fclose(f);
++        std::filesystem::remove(probe, ec);
++      } else {
++        log_config.log_dir = "/data/ng2recomp/logs";
++        std::filesystem::create_directories(log_config.log_dir, ec);
++      }
++    }
++#endif
+   }
+ #if REX_PLATFORM_PS5
+   // [ps5 port] Not a write to the drive after every line, on whichever game
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 7023dfe9..14e4dcd2 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -20,6 +20,7 @@
+ #include <utility>
+ #include <vector>
+ 
++#include <rex/ui/display_clock.h>
+ #include <rex/assert.h>
+ #include <rex/cvar.h>
+ #include <rex/logging.h>
+@@ -139,6 +140,9 @@ VkResult CreatePs5DisplaySurface(const rex::ui::vulkan::VulkanInstance::Function
+ }  // namespace
+ #endif
+ 
++REXCVAR_DEFINE_BOOL(present_low_latency, false, "UI/Presenter",
++                    "[ng2 ps5 port] Two swapchain images instead of three: about one refresh less input "
++                    "latency, less slack for a late paint");
+ REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
+                     "Clear render pass during presentation");
+ 
+@@ -1437,6 +1441,13 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
+   swapchain_create_info.surface = surface;
+   swapchain_create_info.minImageCount =
+       std::max(kSubmissionCount, surface_capabilities.minImageCount);
++  if (REXCVAR_GET(present_low_latency)) {
++    // [ng2 ps5 port] Two images: a painted frame waits behind at most one
++    // other before scanout instead of two - about a refresh less between a
++    // button press and the picture, at the cost of the slack a third image
++    // gives a late paint.
++    swapchain_create_info.minImageCount = std::max(2u, surface_capabilities.minImageCount);
++  }
+   if (surface_capabilities.maxImageCount) {
+     swapchain_create_info.minImageCount =
+         std::min(swapchain_create_info.minImageCount, surface_capabilities.maxImageCount);
+@@ -1743,6 +1754,10 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+       dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
+                                 VK_NULL_HANDLE, &swapchain_image_index);
+   g_svr_paint_ms[0] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - svr_t0).count();
++  // [ng2 ps5 port] An acquire that waited returned at a display vblank: the
++  // guest vblank timer paces itself by these (rex/ui/display_clock.h).
++  rex::ui::display_clock::NoteAcquire(
++      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - svr_t0).count());
+   switch (acquire_result) {
+     case VK_SUCCESS:
+     case VK_SUBOPTIMAL_KHR:
+diff --git a/src/ui/window.cpp b/src/ui/window.cpp
+index b4e045f3..8ad4df42 100644
+--- a/src/ui/window.cpp
++++ b/src/ui/window.cpp
+@@ -55,6 +55,13 @@ REXCVAR_DEFINE_INT32(video_mode_height, 720, "Display", "Guest video mode height
+     .range(480, 0x0FFF)
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++// [ng2 D7] A video mode equal to the default (1280x720) counts as "not set"
++// and the window size is used instead; a title that sets 1280x720 on purpose
++// (Ninja Gaiden II's 16:9 box) asks for it to be taken as given.
++REXCVAR_DEFINE_BOOL(video_mode_explicit, false, "Display",
++                    "Use video_mode_width/height as set, even when they equal the default")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
+ REXCVAR_DEFINE_STRING(resolution, "", "Display",
+                       "Common resolution preset for both guest video mode and startup window (for "
+                       "example: 720p, 1080p, 1440p, 4k, 1280x720)")
+diff --git a/src/ui/windowed_app_main_sdl.cpp b/src/ui/windowed_app_main_sdl.cpp
+index 4f7b3948..d1db88c3 100644
+--- a/src/ui/windowed_app_main_sdl.cpp
++++ b/src/ui/windowed_app_main_sdl.cpp
+@@ -208,13 +208,26 @@ static void Ps5DiagMonitor() {
+         counters[kWatchFaults].load(), counters[kUnhandledFaults].load(), counters[kVblanks].load(),
+         counters[kInterrupts].load(), counters[kWritePointer].load(),
+         counters[kPrimaryBuffers].load());
+-    // Guest threads stuck in one kernel wait for over 5 s.
++    // Guest threads stuck in one kernel wait. [ng2 X4] Each wait is reported
++    // once when it passes 30 s and once more at 300 s, not on every tick past
++    // 5 s: a healthy title screen has waits that long (the PC port measured
++    // thirteen warnings a minute at 10 s). Every wait entry point and contended
++    // critical sections fill these slots, so all of them are covered. The 300 s
++    // line is a fact, not a verdict: read it next to the vblank counter above.
++    static uint64_t reported_30[kWaitSlots] = {}, reported_300[kWaitSlots] = {};
+     const uint64_t now = NowMs();
+-    for (WaitSlot& w : wait_slots) {
++    for (int slot = 0; slot < kWaitSlots; ++slot) {
++      WaitSlot& w = wait_slots[slot];
+       uint64_t since = w.since_ms.load(std::memory_order_acquire);
+-      if (since && since < now && now - since > 5000) {
+-        REXLOG_INFO("ps5 diag:   guest thread {:X} waiting {}s on {} {} handle {:08X}{} from game code {:08X}",
+-                    w.thread_id, (now - since) / 1000, w.count > 1 ? w.count : 1,
++      if (!since || since >= now) continue;
++      const uint64_t waited = now - since;
++      const bool at_30 = waited > 30000 && reported_30[slot] != since;
++      const bool at_300 = waited > 300000 && reported_300[slot] != since;
++      if (at_30 || at_300) {
++        reported_30[slot] = since;
++        if (at_300) reported_300[slot] = since;
++        REXLOG_WARN("ps5 diag:   guest thread {:X} waiting {}s{} on {} {} handle {:08X}{} from game code {:08X}",
++                    w.thread_id, waited / 1000, at_300 ? " (final report)" : "", w.count > 1 ? w.count : 1,
+                     ObjectTypeName(w.object_type), w.handle, w.count > 1 ? " (first of several)" : "",
+                     w.guest_lr);
+         // its callers: each frame's back chain at 0(r1), the caller's LR
+@@ -273,8 +286,31 @@ static void Ps5DiagMonitor() {
+   }
+ }
+ 
++#include <fcntl.h>
++#include <sys/stat.h>
+ int main(int argc, char* argv[]) {
+   chdir("/app0");
++  // [ng2 ps5 port] stdout and stderr into logs/stderr.log: the PS5's RADV
++  // reports what the console cannot run (an indirect buffer, a submission too
++  // large for one AGC submission, a failed sceAgcDriverSubmitDcb) and a line
++  // every 10 s on submission timing, all with fprintf(stderr), which otherwise
++  // goes nowhere. Unbuffered, so a crash cannot swallow the last lines.
++  // Absolute: the process's working directory is not reliably /app0 (relative
++  // writes from this build were lost on the console).
++  mkdir("/app0/logs", 0755);
++  int stderr_fd = open("/app0/logs/stderr.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
++  if (stderr_fd < 0) {  // a read-only app folder: where ps5_paths.cpp writes then
++    mkdir("/data/ng2recomp", 0755);
++    mkdir("/data/ng2recomp/logs", 0755);
++    stderr_fd = open("/data/ng2recomp/logs/stderr.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
++  }
++  if (int fd = stderr_fd; fd >= 0) {
++    dup2(fd, 2);
++    dup2(fd, 1);
++    if (fd > 2) close(fd);
++  }
++  setvbuf(stderr, nullptr, _IONBF, 0);
++  setvbuf(stdout, nullptr, _IOLBF, 0);
+   rex::ps5diag::RegisterThread("main");
+   // A thread that crashed (it would retry its faulting instruction forever,
+   // behind a frozen loading screen): say so and close the game.

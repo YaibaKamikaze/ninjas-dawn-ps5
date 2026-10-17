@@ -24,11 +24,33 @@ import os
 GEN = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                     "..", "..", "generated", "default"))
 
+
+# [ps5 port] Where a function lands among the ng2_recomp.N.cpp shards depends
+# on the SDK build that ran codegen (the Linux codegen for the PS5 port splits
+# them differently from the Windows one), and the listed shards used a Windows
+# path separator. The listed shard is tried first; if it does not hold the
+# anchor (or the fix), the one shard that does is used instead.
+import glob
+
+
+def shard(path, *needles):
+    def holds(p):
+        try:
+            with open(p, encoding="utf-8", errors="replace") as fh:
+                t = fh.read()
+        except OSError:
+            return False
+        return any(n in t for n in needles)
+    if holds(path):
+        return path
+    found = [p for p in sorted(glob.glob(os.path.join(GEN, "ng2_recomp.*.cpp"))) if holds(p)]
+    return found[0] if len(found) == 1 else path
+
 EDITS = [
     # (file, old, new, expected_count)
     # 1. sub_8372398C_missed definition: restore r26/r27 from ctx at entry.
     (
-        GEN + r"\ng2_recomp.234.cpp",
+        os.path.join(GEN, "ng2_recomp.234.cpp"),
         "DEFINE_REX_FUNC(sub_8372398C_missed) {\n"
         "\tREX_FUNC_PROLOGUE();\n"
         "\tPPCRegister r26{};\n"
@@ -42,7 +64,7 @@ EDITS = [
     ),
     # 2. sub_8372398C_missed call site in sub_83723338: spill r26/r27 to ctx.
     (
-        GEN + r"\ng2_recomp.373.cpp",
+        os.path.join(GEN, "ng2_recomp.373.cpp"),
         "\t// b 0x8372398c\n"
         "\tsub_8372398C_missed(ctx, base);",
         "\t// b 0x8372398c\n"
@@ -52,7 +74,7 @@ EDITS = [
     ),
     # 3. sub_83A566F8_missed definition: restore r22/r31 from ctx at entry.
     (
-        GEN + r"\ng2_recomp.236.cpp",
+        os.path.join(GEN, "ng2_recomp.236.cpp"),
         "DEFINE_REX_FUNC(sub_83A566F8_missed) {\n"
         "\tREX_FUNC_PROLOGUE();\n"
         "\tPPCXERRegister xer{};\n"
@@ -70,7 +92,7 @@ EDITS = [
     ),
     # 4. sub_83A566F8_missed call sites in sub_83A4A910: spill r22/r31 (11 sites).
     (
-        GEN + r"\ng2_recomp.172.cpp",
+        os.path.join(GEN, "ng2_recomp.172.cpp"),
         "\tsub_83A566F8_missed(ctx, base);",
         "\tctx.r22.u64 = r22.u64; ctx.r31.u64 = r31.u64;  // NG2FIX\n"
         "\tsub_83A566F8_missed(ctx, base);",
@@ -82,6 +104,7 @@ EDITS = [
 def main():
     changed = 0
     for path, old, new, count in EDITS:
+        path = shard(path, old, new)  # [ps5 port]
         with open(path, encoding="utf-8", errors="replace") as fh:
             txt = fh.read()
         if new in txt:

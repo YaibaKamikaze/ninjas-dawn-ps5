@@ -3,7 +3,7 @@
 # SDK boilerplate lives in generated/rexglue.cmake.
 
 cmake_minimum_required(VERSION 3.25)
-project(ng2 LANGUAGES CXX)
+project(ng2 LANGUAGES C CXX)
 
 # RC is needed for the icon and version block in resources/ng2.rc. Enabled only
 # on Windows: it is the only platform with an .rc compiler, and the executable
@@ -47,6 +47,42 @@ set(NG2_SOURCES
     src/ng2_autoskip.cpp
     src/third_party/stb_image.cpp
 )
+
+# [ps5 port] Ninja Gaiden II for PS5 (ps5/BUILD.md). The PC port's
+# Windows-only code is guarded in place with __PROSPERO__ (platform, hardware
+# detection, performance readouts, texture tools, diagnostics), except the
+# GitHub self-updater, which has nothing to keep and is replaced whole by
+# src/ps5/ng2_update_ps5.cpp. The hub (the screen the app opens on), the
+# in-game overlay and the PlayStation button prompts are PS5-only.
+# [ps5 port] A Linux desktop build of the PS5 app, for looking at the
+# emulated GPU's output without a console (ps5/BUILD.md, "Host test build"):
+# the PS5 code paths with the Sony system calls stubbed, on any Vulkan driver
+# (Mesa's lavapipe will do). Never shipped.
+option(NG2_PS5_HOST_TEST "Build the PS5 app for the Linux desktop (testing only)" OFF)
+if(PS5 OR NG2_PS5_HOST_TEST)
+    file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/ps5/VERSION.txt" NG2_PS5_VERSION LIMIT_COUNT 1)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                 "${CMAKE_CURRENT_SOURCE_DIR}/ps5/VERSION.txt")
+    list(REMOVE_ITEM NG2_SOURCES src/ng2_update.cpp)
+    # The runtime is linked statically on PS5 and already carries stb_image
+    # (src/ui/image_decode.cpp); a second copy is a duplicate definition.
+    list(REMOVE_ITEM NG2_SOURCES src/third_party/stb_image.cpp)
+    list(APPEND NG2_SOURCES
+        src/ps5/ng2_update_ps5.cpp
+        src/ps5/ps5_paths.cpp
+        src/ps5/ps5_pad.cpp
+        src/ps5/ps5_sound.cpp
+        src/ps5/ps5_textures.cpp
+        src/ps5/ps5_button_prompts.cpp
+        src/ps5/hub/hub_ui.cpp
+        src/ps5/hub/hub_settings.cpp
+        src/ps5/hub/hub_pages.cpp
+        src/ps5/hub/hub_backdrop.cpp
+        src/ps5/hub/hub_sfx.cpp
+        src/ps5/hub/ps5_hub.cpp
+        src/ps5/overlay/ps5_overlay.cpp)
+    message(STATUS "Ninja Gaiden II for PS5 ${NG2_PS5_VERSION}")
+endif()
 
 # The icon. Explorer, the desktop shortcut and the taskbar all read it from
 # here - see the comment at the top of resources/ng2.rc.in.
@@ -99,7 +135,9 @@ rexglue_setup_target(ng2 GPU_PLUGINS xenos)
 # regression impossible: whenever codegen refreshes codegen.build.stamp, the
 # patches are re-applied (idempotent - each script skips a file already carrying
 # its marker) before the generated .cpp are compiled.
-if(TARGET ng2_codegen AND TARGET ng2_recomp)
+# [ps5 port] Not in a cross build: codegen and its patches run on the host
+# (ps5/BUILD.md), and the PS5 build compiles what they left in generated/.
+if(TARGET ng2_codegen AND TARGET ng2_recomp AND NOT CMAKE_CROSSCOMPILING)
     find_program(NG2_PYTHON NAMES python python3)
     if(NG2_PYTHON)
         set(_ng2_gen "${CMAKE_CURRENT_SOURCE_DIR}/generated/default")
@@ -125,6 +163,36 @@ if(TARGET ng2_codegen AND TARGET ng2_recomp)
 endif()
 
 target_compile_definitions(ng2 PRIVATE NG2_VERSION="${NG2_VERSION}")
+
+if(PS5)
+    # [ps5 port] Linux names for the POSIX code (as in the SDK), ImGui and stb
+    # from the SDK tree, the hub's fonts, and the PS5 system services the app
+    # uses directly (the user, the pad, audio out, the system shell).
+    target_compile_definitions(ng2 PRIVATE
+        NG2_PS5_VERSION="${NG2_PS5_VERSION}"
+        NG2_PS5_FONTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/ps5/assets/fonts")
+    target_compile_options(ng2 PRIVATE "SHELL:-include ${REXSDK_DIR}/include/rex/ps5_compat.h")
+    target_include_directories(ng2 PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        $<TARGET_PROPERTY:imgui,INTERFACE_INCLUDE_DIRECTORIES>
+        ${REXSDK_DIR}/thirdparty/stb
+        ${REXSDK_DIR}/thirdparty/xxHash)
+    target_link_libraries(ng2 PRIVATE SceUserService ScePad SceAudioOut SceSystemService)
+elseif(NG2_PS5_HOST_TEST)
+    # NG2's own sources take their PS5 paths (__PROSPERO__ for them only: the
+    # SDK's platform detection checks __gnu_linux__ first, so it stays Linux),
+    # with the handful of Sony calls they make stubbed.
+    target_sources(ng2 PRIVATE src/ps5/host_test_stubs.cpp)
+    target_compile_definitions(ng2 PRIVATE
+        __PROSPERO__=1 NG2_PS5_HOST_TEST=1
+        NG2_PS5_VERSION="${NG2_PS5_VERSION}-hosttest"
+        NG2_PS5_FONTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/ps5/assets/fonts")
+    target_include_directories(ng2 PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        $<TARGET_PROPERTY:imgui,INTERFACE_INCLUDE_DIRECTORIES>
+        ${REXSDK_DIR}/thirdparty/stb
+        ${REXSDK_DIR}/thirdparty/xxHash)
+endif()
 
 # DXGI, for reading the video-memory budget in src/ng2_hwdetect.cpp.
 # WinHTTP, for the on-launch update check and download in src/ng2_update.cpp.
