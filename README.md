@@ -39,7 +39,7 @@ own disc. If you do not own Ninja Gaiden II, this has nothing to offer you.
 The short version (the full one, with every folder and setting explained, is in
 **[docs/PS5_GUIDE.md](docs/PS5_GUIDE.md)**):
 
-1. Download `ninjas-dawn-ps5-v0.1.0-alpha.zip` from
+1. Download the latest `ninjas-dawn-ps5-v…-alpha.zip` from
    [Releases](../../releases) and unzip it. You get a folder named **`PPSA94202`**.
 2. Copy your extracted game - `default.xex`, every `.ng2` archive, the `.wmv`
    videos and the rest of the disc's files - into **`PPSA94202/Game Data/`**.

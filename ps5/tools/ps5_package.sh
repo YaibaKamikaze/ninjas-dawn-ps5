@@ -72,10 +72,26 @@ echo "==> [package] eboot.bin for $title_id"
 app=$build/ps5-app/$title_id
 rm -rf -- "$app"
 mkdir -p "$app/sce_sys" "$app/sce_module"
+# The binary carries the absolute paths of source files (assertion and log
+# messages): the build machine's home folder would be published in every
+# release. Replace that prefix with a placeholder of the same length (so no
+# offset moves) before signing.
+python3 - "$stage/build/eboot.elf" "$(dirname "$(dirname "$ps5dir")")" <<'PY'
+import sys
+path, prefix = sys.argv[1], sys.argv[2].encode()
+data = open(path, "rb").read()
+if len(prefix) >= 4:
+    placeholder = (b"/src" + b"_" * len(prefix))[:len(prefix)]
+    count = data.count(prefix)
+    data = data.replace(prefix, placeholder)
+    open(path, "wb").write(data)
+    print(f"==> [package] {count} build-machine path(s) replaced in eboot.elf")
+PY
 "$tool" self --sign --in "$stage/build/eboot.elf" --out "$app/eboot.bin" --magic 0x1D3D154F
 cp "$tri/runtime/libc.prx" "$app/sce_module/libc.prx"
 
-content_version=$(printf '%02d.%03d.000' "$(cut -d. -f1 <<<"$version")" "$(cut -d. -f2 <<<"$version")")
+content_version=$(printf '%02d.%03d.%03d' "$(cut -d. -f1 <<<"$version")" "$(cut -d. -f2 <<<"$version")" \
+    "$(cut -d. -f3 <<<"$version.0")")
 cat > "$app/sce_sys/param.json" <<EOF
 {
   "ageLevel": { "default": 0 },

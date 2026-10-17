@@ -254,13 +254,21 @@ void ng2PatchSkipVideos(PPCRegister& r28) {
 
   const std::string name(path, len);
 
-  // Skip the openings and the attract demos, never a chapter-loading video.
   // [ps5 port] The mirror this source came from had lost the backslash here,
   // so guest paths (game:\video\...) were never split and the name check
   // below never matched.
   const auto slash = name.find_last_of("\\/:");
   const std::string base = slash == std::string::npos ? name : name.substr(slash + 1);
-  if (_strnicmp(base.c_str(), "aurora", 6) == 0)
+  // [ps5 port] Skip only the opening (NinjaVI, NinjaVI_Left/Right): it is
+  // the one video the game moves past when the open fails. It is not only the
+  // chapter-loading videos (aurora*) that must play - the tutorial videos a
+  // chest, a new weapon or ninpo shows (tutorial_01..11, tutorial_n01..n04)
+  // take a failed open as a bad disc too, and the game stops:
+  //   Patch: skipping video game:\tutorial_02.wmv
+  //   [NtCreateFile] FAILED: path='game:\__video_skipped__.wmv' -> 0xc000000f
+  //   XamShowDirtyDiscErrorUI called! user_index=0
+  // So this lists what may be skipped rather than what may not.
+  if (_strnicmp(base.c_str(), "ninjavi", 7) != 0)
     return;
 
   static std::string last;

@@ -21,7 +21,7 @@ Everything about installing and playing the PS5 alpha. For building it, see
 
 ## 2. Installing
 
-1. Download **`ninjas-dawn-ps5-v0.1.0-alpha.zip`** from the Releases page and
+1. Download the latest **`ninjas-dawn-ps5-v…-alpha.zip`** from the Releases page and
    unzip it. Inside is a folder named **`PPSA94202`** (the app's title id):
 
    ```

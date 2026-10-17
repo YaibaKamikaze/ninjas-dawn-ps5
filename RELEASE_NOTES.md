@@ -1,5 +1,19 @@
 # Release notes
 
+## v0.1.1-alpha - hotfix
+
+- **Fixed: opening a chest (or anything that shows a tutorial video - a new
+  weapon, ninpo...) stopped the game** with a "disc read error" when *Skip
+  intro videos* was on. The skip redirected every video except the
+  chapter-loading ones, and the game treats a tutorial video that fails to open
+  as a damaged disc. It now skips only the opening video (NinjaVI), the one it
+  was meant for; every other video plays.
+- The app's version now shows its patch number (00.001.001).
+- Release builds no longer contain the build machine's folder names.
+
+Updating from v0.1.0: copy the new `eboot.bin` and `sce_sys/` over the old ones
+(nothing else changed; keep your `Game Data/` and `UserData/`).
+
 ## v0.1.0-alpha - first PS5 alpha (internal build 16.4)
 
 The first public build of Ninja's Dawn for PS5: Ninja Gaiden II, statically
