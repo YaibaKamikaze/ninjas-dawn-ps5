@@ -8,7 +8,7 @@ of time into native code and runs as a PS5 homebrew app, rendered through Vulkan
 > **Alpha.** It plays the game at **1440p and 60 fps**, but it is early: expect
 > occasional crashes and rough edges. See [Known issues](#known-issues).
 
-This is a fork of [Ninja's Dawn](https://github.com/TheSaltTrader/Ninja-s-Dawn---A-Ninja-Gaiden-2-Recompilation-Project)
+This is a fork of [Ninja's Dawn](https://github.com/FermataRest/Ninja-s-Dawn-A-Ninja-Gaiden-2-Recompilation-Project)
 by TheSaltTrader, the PC recompilation it is built on. Their README is kept here
 as [README_PC.md](README_PC.md).
 

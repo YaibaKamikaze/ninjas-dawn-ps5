@@ -9,7 +9,7 @@ Ninja's Dawn for PS5 stands on a lot of other people's work.
 
 ## The recompilation it is built on
 
-- **TheSaltTrader** - [Ninja's Dawn](https://github.com/TheSaltTrader/Ninja-s-Dawn---A-Ninja-Gaiden-2-Recompilation-Project),
+- **TheSaltTrader** - [Ninja's Dawn](https://github.com/FermataRest/Ninja-s-Dawn-A-Ninja-Gaiden-2-Recompilation-Project),
   the static recompilation of Ninja Gaiden II for PC that this port is a fork
   of: the function map, the game-specific fixes and hooks, the settings, the
   save import, the texture-pack format, and the long record of what was found
