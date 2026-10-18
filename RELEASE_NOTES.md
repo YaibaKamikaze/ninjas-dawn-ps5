@@ -1,5 +1,19 @@
 # Release notes
 
+## v0.1.3-alpha - freeze fix
+
+- **Fixed: the game froze going into the cutscene between the two halves of
+  chapter 1** (and could freeze the same way elsewhere). Some of the game's
+  worker threads put themselves to sleep after each job and are woken once
+  when the next one starts. When the wake-up arrived just before the worker
+  had gone to sleep, the PS5 build dropped it, and the worker slept forever -
+  the game's main loop then waited for it endlessly. An early wake-up is now
+  kept and cancels the worker's next sleep, as the PC build has always
+  effectively done. Tested through the rest of chapter 1 into chapter 2.
+
+Updating from v0.1.2.1: copy the new `eboot.bin` and `sce_sys/` over the old
+ones; keep `Game Data/` and `UserData/`.
+
 ## v0.1.2.1-alpha - performance
 
 The biggest performance update so far. In the heaviest fights tested, the worst
