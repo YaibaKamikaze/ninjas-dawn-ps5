@@ -419,12 +419,13 @@ class Ng2App : public rex::ReXApp {
       ng2ps5::overlay::Callbacks callbacks;
       callbacks.apply_live = [this] {
         ng2::ApplyLiveSettings(settings_, window());
-        ng2::SetAutoSkipEnabled(settings_.skip_cinematics);
+        ng2::SetAutoSkipEnabled(false);  // (cinematics skip removed from the PS5 app: see below)
         rex::cvar::SetFlagByName("guest_vblank_display_locked",
                                  settings_.ps5_display_locked_vblank ? "true" : "false");
         rex::cvar::SetFlagByName("gpu_phase_timer_details", settings_.ps5_gpu_timer_details ? "true" : "false");
         rex::cvar::SetFlagByName("vulkan_texture_descriptor_reuse", settings_.ps5_descriptor_reuse ? "true" : "false");
         rex::cvar::SetFlagByName("vulkan_async_submission", settings_.ps5_async_submission ? "true" : "false");
+        rex::cvar::SetFlagByName("audio_resync", settings_.ps5_audio_resync ? "true" : "false");
         rex::cvar::SetFlagByName("gpu_profile_command_thread", settings_.ps5_profile_gpu ? "true" : "false");
         rex::cvar::SetFlagByName("gpu_profile_thread_name",
                                  settings_.ps5_profile_target == 1 ? "Main XThread" : "GPU Commands");
@@ -1153,7 +1154,10 @@ class Ng2App : public rex::ReXApp {
     // The synthetic pad that dismisses chapter-opening cinematics. Added after
     // the assignment so SharedAssignment picks it up with everything else; it
     // reports nothing at all unless a chapter load has armed it.
-    ng2::SetAutoSkipEnabled(settings_.skip_cinematics);
+    // [ps5 port] Never armed here: "Skip chapter cinematics" is gone from the
+    // hub (the owner removed it), and a settings file that still has it on
+    // must not bring it back. The driver stays for NG2_PAD_SCRIPT testing.
+    ng2::SetAutoSkipEnabled(false);
     input->AddDriver(ng2::MakeAutoSkipDriver());
     REXLOG_INFO("Input: every controller drives guest user 0");
   }

@@ -181,6 +181,8 @@ struct Ng2Tuning {
                    "[ps5] diagnostics: sample the GPU command thread"});
     out.push_back({"vulkan_async_submission", s.ps5_async_submission ? "true" : "false",
                    "[ps5] experimental: submit on a worker thread"});
+    out.push_back({"audio_resync", s.ps5_audio_resync ? "true" : "false",
+                   "[ps5] cutscene audio fix: drop the audio backlog after a stall"});
     out.push_back({"vulkan_texture_descriptor_reuse", s.ps5_descriptor_reuse ? "true" : "false",
                    "[ps5] experimental: reuse unchanged texture descriptor sets"});
     out.push_back({"gpu_phase_timer_details", s.ps5_gpu_timer_details ? "true" : "false",

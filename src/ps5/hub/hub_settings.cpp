@@ -168,9 +168,11 @@ std::vector<Setting> Build() {
   }
   t.push_back(Ints(Tab::kGame, "Skip intro videos", "Goes straight to the title screen.", &Ng2Settings::video_mode,
                    {0, 2}, {"Off", "On"}, 0, false, true));
-  t.push_back(Toggle(Tab::kGame, "Skip chapter cinematics",
-                     "Dismisses the cinematic at the start of a chapter. Touching the controller stops it.",
-                     &Ng2Settings::skip_cinematics, false, false, true));
+  t.push_back(Toggle(Tab::kGame, "Cutscene audio fix",
+                     "Keeps sound level with the picture. When the game falls behind for a moment, the sound "
+                     "that piled up is skipped instead of playing late, so voices and effects don't drift "
+                     "out of sync in cutscenes. Turn off to hear the original behaviour.",
+                     &Ng2Settings::ps5_audio_resync, true, false, true));
   t.push_back(Toggle(Tab::kGame, "Workaround: chapter 12",
                      "The community fix for the chapter 12 crash. Turn it on only if you are stuck there: it "
                      "causes problems elsewhere.",

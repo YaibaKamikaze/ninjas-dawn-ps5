@@ -92,7 +92,8 @@ but drops below 60 fps in heavy scenes; FBO is faster but hitches more.
 | Graphics | Workarounds (fuzzy alpha test, accurate depth) | Only for specific glitches. |
 | Game | Button prompts | PlayStation (default) or the original buttons. |
 | Game | Flying Swallow flash | *Coming soon.* |
-| Game | Skip intro videos / Skip chapter cinematics | Straight to the title screen / past chapter intros. |
+| Game | Skip intro videos | Straight to the title screen. |
+| Game | Cutscene audio fix | On (default): keeps sound level with the picture - when the game falls behind for a moment, the sound that piled up is skipped instead of playing late. |
 | Game | Workaround: chapter 12 | The community fix for the chapter 12 crash - only if you are stuck there. |
 | Game | Hub music | Music behind the hub. |
 | Textures | Dump textures | Writes the game's textures to `Texture Packs/PS5 Dump/` for the PC pack tools. |

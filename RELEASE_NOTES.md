@@ -1,5 +1,22 @@
 # Release notes
 
+## v0.1.4-alpha - cutscene audio fix
+
+- **Cutscene audio fix** (Settings > Game, on by default): sound in cutscenes
+  drifted out of sync with the picture and some effects went missing - the
+  well-known Ninja Gaiden II symptom under Xenia too. The game renders its
+  audio whenever the console asks for the next few milliseconds; when the game
+  was a moment late, silence played in its place and was never taken back out,
+  so every brief stall pushed all later sound further behind. Now, when the
+  game catches up, the sound that piled up is skipped in one small jump, and
+  the steady audio delay is about 32 ms instead of 85 ms. Turn it off to hear
+  the original behaviour.
+- **Faster streaming reads:** large file reads are split into 512 KB pieces, so
+  the game's sound-bank reads (and save-file opens) no longer wait behind a
+  whole 10 MB level-data read.
+- **Removed:** the *Skip chapter cinematics* setting.
+- Includes the v0.1.3 freeze fix below.
+
 ## v0.1.3-alpha - freeze fix
 
 - **Fixed: the game froze going into the cutscene between the two halves of

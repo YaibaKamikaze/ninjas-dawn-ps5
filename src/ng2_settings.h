@@ -340,6 +340,9 @@ struct Ng2Settings {
   int ps5_profile_target = 0;
   // Experimental: replay and submit command buffers on a worker thread.
   bool ps5_async_submission = true;
+  // Cutscene audio fix (audio_resync): drop the audio backlog after the game
+  // was late, so sound stays level with the picture.
+  bool ps5_audio_resync = true;
   // Developer, diagnostic: capture a frame report this many seconds after
   // the first frame (0 off) - every rendered image of two frames, written to
   // logs/frame_reports - not saved on.
@@ -511,6 +514,7 @@ struct Ng2Settings {
         << "ps5_verify_refresh=" << (ps5_verify_refresh ? 1 : 0) << "\n"
         << "ps5_profile_target=" << ps5_profile_target << "\n"
         << "ps5_async_submission=" << (ps5_async_submission ? 1 : 0) << "\n"
+        << "ps5_audio_resync=" << (ps5_audio_resync ? 1 : 0) << "\n"
 
         << "ps5_menu_music=" << (ps5_menu_music ? 1 : 0) << "\n"
         << "ps5_defaults_applied=" << (ps5_defaults_applied ? 1 : 0) << "\n"
@@ -636,6 +640,7 @@ struct Ng2Settings {
     else if (k == "ps5_verify_refresh") ps5_verify_refresh = Truthy(v);
     else if (k == "ps5_profile_target") ps5_profile_target = std::clamp(std::atoi(v.c_str()), 0, 1);
     else if (k == "ps5_async_submission") ps5_async_submission = Truthy(v);
+    else if (k == "ps5_audio_resync") ps5_audio_resync = Truthy(v);
 
     else if (k == "ps5_menu_music") ps5_menu_music = Truthy(v);
     else if (k == "ps5_defaults_applied") ps5_defaults_applied = Truthy(v);
