@@ -219,10 +219,37 @@ std::vector<Setting> Build() {
                      "or skipped. Timer is the runtime's 60 Hz clock, which drifts against the TV.",
                      &Ng2Settings::ps5_display_locked_vblank, true, false, true, "Timer", "Display refresh"));
   t.push_back(Toggle(Tab::kPerformance, "Input latency",
-                     "Low shows each frame about one refresh (16 ms) sooner after a button press. Standard "
-                     "keeps a third picture queued, which gives a late frame more slack: the safer choice "
-                     "if Low stutters.",
+                     "Standard keeps a third picture queued, so a frame that runs a little late is still "
+                     "shown on time: steady timing. Low shows each frame about one refresh (16 ms) sooner, "
+                     "but a late frame is then shown a refresh later, so timing can feel uneven in heavy "
+                     "scenes.",
                      &Ng2Settings::ps5_low_latency, false, true, false, "Standard", "Low"));
+  t.push_back(Ints(Tab::kPerformance, "Memory refresh",
+                   "Ninja Gaiden II needs its GPU copy of memory refreshed every frame: characters' animation "
+                   "is written where nothing else notices it. Less often is faster but makes animation twitch "
+                   "- keep Every frame, and let Skip unchanged memory make it cheap.",
+                   &Ng2Settings::ps5_memory_refresh, {1, 2, 4},
+                   {"Every frame", "Every 2nd frame", "Every 4th frame"}, 0, false, true));
+  t.push_back(Toggle(Tab::kPerformance, "Skip unchanged memory",
+                     "After the per-frame memory refresh, uploads only the memory whose content actually changed "
+                     "(animation still updates every frame) instead of all of it: the biggest saving in heavy "
+                     "scenes. Turn it off if anything looks stale or wrong.",
+                     &Ng2Settings::ps5_verify_refresh, true, false, true));
+  t.push_back(Toggle(Tab::kPerformance, "Fast memory checks",
+                     "Checks whether a draw's memory is already on the GPU before taking the runtime's global "
+                     "lock, which every draw otherwise takes several times. Turn it off only if something looks "
+                     "wrong.",
+                     &Ng2Settings::ps5_fast_memory_checks, true, false, true));
+  t.push_back(Toggle(Tab::kPerformance, "Async submission",
+                     "Hands each finished batch of GPU work to a second thread to record and submit, so the main "
+                     "GPU thread can carry on with the game's next commands: faster in heavy scenes. If it ever "
+                     "stutters, glitches or freezes with it on, turn it off and report it.",
+                     &Ng2Settings::ps5_async_submission, true, false, true));
+  t.push_back(Toggle(Tab::kPerformance, "Descriptor reuse (experimental)",
+                     "Lets a draw reuse the previous draw's texture bindings when nothing changed: less CPU work "
+                     "per draw, which is what limits the frame rate in heavy scenes. New - if textures look "
+                     "wrong or flicker with it on, turn it off and report it.",
+                     &Ng2Settings::ps5_descriptor_reuse, false, false, true));
   t.push_back(Toggle(Tab::kPerformance, "Render target path",
                      "How the original console's EDRAM is emulated. FSI is exact and the stable choice. FBO is "
                      "experimental: faster at high resolutions, but it hitches and stutters more and may show "
@@ -233,6 +260,13 @@ std::vector<Setting> Build() {
                      "Diagnostic only: logs where the GPU thread's time goes inside draws, every 10 s. Reading "
                      "the clock thousands of times a frame costs some frame rate, so leave it off to play.",
                      &Ng2Settings::ps5_gpu_timer_details, false, false, true));
+  t.push_back(Toggle(Tab::kDeveloper, "Profile GPU thread",
+                     "Diagnostic: samples the thread that turns the game's drawing into Vulkan work, a thousand "
+                     "times a second, and logs where its time goes (8 s of every 10). Light enough to play with; "
+                     "turn it on in a slow area for half a minute, then off.",
+                     &Ng2Settings::ps5_profile_gpu, false, false, true));
+  t.push_back(Ints(Tab::kDeveloper, "Profile thread", "Which thread Profile GPU thread samples.",
+                   &Ng2Settings::ps5_profile_target, {0, 1}, {"GPU commands", "Game main thread"}, 0, false, true));
   t.push_back(Ints(Tab::kDeveloper, "Frame report",
                    "Diagnostic only: saves every image the game renders for two frames, this long after the "
                    "game starts, to logs/frame_reports (use 720p). Or capture one from the in-game menu.",
@@ -257,6 +291,8 @@ void ApplyPs5Defaults(Ng2Settings& s) {
   s.ps5_resolution = 1;
   s.ps5_render_target_fbo = false;
   s.ps5_menu_music = true;
+  s.ps5_async_submission = true;
+  s.ps5_low_latency = false;
   s.ps5_render_scale = 0;
   s.internal_720p = true;
   s.fps = 60;
@@ -283,9 +319,28 @@ void UpdatePs5Defaults(Ng2Settings& s) {
     s.ps5_render_target_fbo = false;
     s.ps5_menu_music = true;  // (the hub has its theme from this round on)
   }
+  // (The rounds run oldest first, so a later round's choice wins.)
   if (s.ps5_defaults_version < 3) {
     // Round 3: build 14 made Low input latency the default; Standard is again
     // until Low has been compared on the console.
+    s.ps5_low_latency = false;
+  }
+  if (s.ps5_defaults_version < 4) {
+    // Round 4: a memory refresh less often than every frame makes animation
+    // twitch (16.9 testing); back to every frame, now cheap with Skip
+    // unchanged memory.
+    s.ps5_memory_refresh = 1;
+    s.ps5_verify_refresh = true;
+  }
+  if (s.ps5_defaults_version < 5) {
+    // Round 5: asynchronous submission (with the frame split into batches)
+    // measured faster and felt better.
+    s.ps5_async_submission = true;
+  }
+  if (s.ps5_defaults_version < 6) {
+    // Round 6: Low input latency (round 5, build 16.13) made jump timing
+    // feel uneven: with two pictures a frame that misses a refresh waits for
+    // the next one. Standard again; Low stays a choice.
     s.ps5_low_latency = false;
   }
   s.ps5_defaults_version = kPs5DefaultsVersion;

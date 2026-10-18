@@ -29,6 +29,18 @@ index 751a6860..2f58f3ef 100644
    uint32_t read_ptr_update_freq_ = 0;
    uint32_t read_ptr_writeback_ptr_ = 0;
  
+diff --git a/include/rex/graphics/flags.h b/include/rex/graphics/flags.h
+index 2cf24c4c..fad7ec17 100644
+--- a/include/rex/graphics/flags.h
++++ b/include/rex/graphics/flags.h
+@@ -16,6 +16,7 @@
+ // GPU Core
+ REXCVAR_DECLARE(bool, vsync);
+ REXCVAR_DECLARE(bool, clear_memory_page_state);
++REXCVAR_DECLARE(int32_t, clear_memory_page_state_interval);  // [ng2 ps5 port]
+ REXCVAR_DECLARE(bool, half_pixel_offset);
+ REXCVAR_DECLARE(bool, async_shader_compilation);
+ 
 diff --git a/include/rex/graphics/ng2_phase_timer.h b/include/rex/graphics/ng2_phase_timer.h
 new file mode 100644
 index 00000000..b30617a1
@@ -116,7 +128,7 @@ index 00000000..b30617a1
 +
 +}  // namespace rex::graphics::ng2phase
 diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
-index 4d85a2b5..ff02ee27 100644
+index 4d85a2b5..29edfd58 100644
 --- a/include/rex/graphics/shared_memory.h
 +++ b/include/rex/graphics/shared_memory.h
 @@ -160,6 +160,8 @@ class SharedMemory {
@@ -128,6 +140,26 @@ index 4d85a2b5..ff02ee27 100644
  
    // Mutex between the guest memory subsystem and the command processor, to be
    // locked when checking or updating validity of pages/ranges and when firing
+@@ -174,6 +176,19 @@ class SharedMemory {
+   std::vector<uint64_t> system_page_flags_valid_;
+   // Subset of valid pages containing data written by the GPU.
+   std::vector<uint64_t> system_page_flags_valid_and_gpu_written_;
++  // [ng2 ps5 port] Verified refresh (shared_memory_verify_refresh): pages the
++  // frame-end refresh took the valid bit from, and the hash of each page's
++  // content when it was last uploaded. A pending page whose content still
++  // hashes the same is marked valid again without being uploaded.
++  std::vector<uint64_t> refresh_pending_;
++  std::vector<uint64_t> page_hashes_;
++  std::vector<std::pair<uint32_t, uint32_t>> verified_upload_ranges_;
++  // The hashes of upload_ranges_' pages, in order (HashUploadPages); requests
++  // over kVerifyInLockPages pages are hashed with the global lock released.
++  std::vector<uint64_t> verify_hashes_;
++  static constexpr uint32_t kVerifyInLockPages = 8;
++  void HashUploadPages();
++  void VerifyUploadPages();
+   uint32_t num_system_page_flags_ = 0;
+ 
+   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
 diff --git a/include/rex/graphics/texture_load_hook.h b/include/rex/graphics/texture_load_hook.h
 new file mode 100644
 index 00000000..ca7ad1da
@@ -175,10 +207,28 @@ index 00000000..ca7ad1da
 +
 +}  // namespace rex::graphics
 diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
-index ab4ced07..949f48a8 100644
+index ab4ced07..9417e874 100644
 --- a/include/rex/graphics/vulkan/command_processor.h
 +++ b/include/rex/graphics/vulkan/command_processor.h
-@@ -268,6 +268,9 @@ class VulkanCommandProcessor : public CommandProcessor {
+@@ -11,13 +11,17 @@
+  */
+ 
+ #include <array>
++#include <atomic>
+ #include <climits>
++#include <condition_variable>
+ #include <cstdint>
+ #include <deque>
+ #include <functional>
+ #include <memory>
++#include <mutex>
+ #include <string>
+ #include <string_view>
++#include <thread>
+ #include <unordered_map>
+ #include <utility>
+ #include <vector>
+@@ -268,6 +272,9 @@ class VulkanCommandProcessor : public CommandProcessor {
    bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                   IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
    bool IssueCopy() override;
@@ -188,6 +238,90 @@ index ab4ced07..949f48a8 100644
  
   private:
    struct CommandBuffer {
+@@ -362,6 +369,20 @@ class VulkanCommandProcessor : public CommandProcessor {
+     VkDescriptorSet set;
+   };
+ 
++  // [ng2 ps5 port] The texture descriptor set last written for a stage, so a
++  // draw with the same images and samplers binds it again instead of writing
++  // a new one (WWE 2K14 Recomp's 0025, BSD-3, PromethenDev). Valid only within
++  // the frame, submission and transient-pool generation it was written in.
++  struct TextureDescriptorSetReuse {
++    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
++    VkDescriptorSet set = VK_NULL_HANDLE;
++    uint64_t frame = 0;
++    uint64_t submission = 0;
++    uint64_t allocator_generation = 0;
++    std::vector<VkDescriptorImageInfo> image_infos;
++    bool valid = false;
++  };
++
+   enum SwapApplyGammaDescriptorSet : uint32_t {
+     kSwapApplyGammaDescriptorSetRamp,
+     kSwapApplyGammaDescriptorSetSource,
+@@ -427,6 +448,26 @@ class VulkanCommandProcessor : public CommandProcessor {
+   bool CanEndSubmissionImmediately() const;
+ 
+   void ClearTransientDescriptorPools();
++  void InvalidateTextureDescriptorSetReuse();  // [ng2 ps5 port]
++  // [ng2 ps5 port] Asynchronous submission (vulkan_async_submission): a
++  // closed non-swap submission's command stream is replayed into its command
++  // buffer and submitted by a worker thread; all bookkeeping stays here.
++  // After WWE 2K14 Recomp's 0026 (BSD-3, PromethenDev), reduced to the replay
++  // and vkQueueSubmit.
++  struct AsyncSubmitJob {
++    CommandBuffer command_buffer = {};
++    VkFence fence = VK_NULL_HANDLE;
++    uint64_t submission = 0;
++    std::vector<VkSemaphore> wait_semaphores;
++    std::vector<VkPipelineStageFlags> wait_stage_masks;
++    std::unique_ptr<DeferredCommandBuffer> stream;
++  };
++  void AsyncSubmitWorkerMain();
++  void DrainAsyncSubmit();
++  void StopAsyncSubmit();
++  // Submissions up to this one have been passed to vkQueueSubmit (or were
++  // submitted here); fences after it must not be touched yet.
++  uint64_t AsyncSubmittedThrough() const;
+   bool IssueCopy_ReadbackResolvePath();
+   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
+   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
+@@ -606,6 +647,20 @@ class VulkanCommandProcessor : public CommandProcessor {
+   std::unordered_map<TextureDescriptorSetLayoutKey, std::vector<VkDescriptorSet>,
+                      TextureDescriptorSetLayoutKey::Hasher>
+       texture_transient_descriptor_sets_free_;
++  std::thread async_submit_thread_;  // [ng2 ps5 port]
++  mutable std::mutex async_submit_mutex_;
++  std::condition_variable async_submit_cv_;
++  std::condition_variable async_submit_idle_cv_;
++  std::deque<AsyncSubmitJob> async_submit_jobs_;
++  std::vector<std::unique_ptr<DeferredCommandBuffer>> async_submit_free_streams_;
++  bool async_submit_busy_ = false;
++  bool async_submit_stop_ = false;
++  std::atomic<uint64_t> async_submitted_through_{0};
++  std::atomic<int> async_submit_error_{0};  // VkResult of a failed worker submit
++  uint64_t async_submit_last_enqueued_ = 0;
++  uint32_t draws_in_submission_ = 0;  // for vulkan_async_submission_split_draws
++  std::array<TextureDescriptorSetReuse, 2> texture_descriptor_set_reuse_;  // [ng2 ps5 port] vertex, pixel
++  uint64_t texture_descriptor_allocator_generation_ = 1;
+ 
+   std::unique_ptr<VulkanSharedMemory> shared_memory_;
+ 
+diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
+index 9d2a8485..ad76fd14 100644
+--- a/include/rex/graphics/vulkan/deferred_command_buffer.h
++++ b/include/rex/graphics/vulkan/deferred_command_buffer.h
+@@ -30,6 +30,10 @@ class DeferredCommandBuffer {
+ 
+   void Reset();
+   void Execute(VkCommandBuffer command_buffer);
++  // [ng2 ps5 port] Exchanges the recorded commands with another buffer's (no
++  // copy): the asynchronous submission worker takes a closed submission's
++  // stream and the command processor carries on with an empty one.
++  void SwapStream(DeferredCommandBuffer& other) { command_stream_.swap(other.command_stream_); }
+ 
+   // render_pass_begin->pNext of all barriers must be null.
+   void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,
 diff --git a/include/rex/graphics/vulkan/render_target_cache.h b/include/rex/graphics/vulkan/render_target_cache.h
 index 34f70337..83efe6a0 100644
 --- a/include/rex/graphics/vulkan/render_target_cache.h
@@ -202,6 +336,22 @@ index 34f70337..83efe6a0 100644
  
    // Performs the resolve to a shared memory area according to the current
    // register values, and also clears the render targets if needed. Must be in a
+diff --git a/include/rex/graphics/vulkan/texture_cache.h b/include/rex/graphics/vulkan/texture_cache.h
+index 04856ee7..473b46b6 100644
+--- a/include/rex/graphics/vulkan/texture_cache.h
++++ b/include/rex/graphics/vulkan/texture_cache.h
+@@ -266,6 +266,11 @@ class VulkanTextureCache final : public TextureCache {
+     Usage usage_ = Usage::kUndefined;
+ 
+     std::unordered_map<ViewKey, VkImageView, ViewKey::Hasher> views_;
++    // [ng2 ps5 port] The view GetView returned last (a texture is nearly always
++    // bound one way): skips the map lookup on every binding. Views live as
++    // long as the texture, so this never dangles.
++    ViewKey last_view_key_;
++    VkImageView last_view_ = VK_NULL_HANDLE;
+     std::unique_ptr<VulkanTexture> texture_3d_as_2d_;
+     VkImageView image_view_3d_as_2d_unsigned_ = VK_NULL_HANDLE;
+     VkImageView image_view_3d_as_2d_signed_ = VK_NULL_HANDLE;
 diff --git a/include/rex/ppc/intrinsics.h b/include/rex/ppc/intrinsics.h
 index 3c2fe090..11b8c87b 100644
 --- a/include/rex/ppc/intrinsics.h
@@ -242,6 +392,118 @@ index 3c2fe090..11b8c87b 100644
  using rex::ppc::VectorMaskR;
  using rex::ppc::VectorShiftTableL;
  using rex::ppc::VectorShiftTableR;
+diff --git a/include/rex/ps5_diag.h b/include/rex/ps5_diag.h
+index 6c9fb6ad..9b33b062 100644
+--- a/include/rex/ps5_diag.h
++++ b/include/rex/ps5_diag.h
+@@ -17,6 +17,13 @@ enum Counter : int {
+   kInterrupts,          // guest GPU interrupt callbacks run
+   kWritePointer,        // ring buffer write pointer updates by the game
+   kPrimaryBuffers,      // ring buffer batches executed
++  kProtectCalls,        // [ng2 ps5 port] mprotect calls (rex::memory::Protect)
++  kProtectPages,        // [ng2 ps5 port] host pages they covered
++  kRefreshHashCalls,    // [ng2 ps5 port] RequestRanges calls that hashed pages (verified refresh)
++  kRefreshHashPages,    // [ng2 ps5 port] pages hashed
++  kRefreshSkipPages,    // [ng2 ps5 port] of those, unchanged: marked valid without an upload
++  kRefreshBigCalls,     // [ng2 ps5 port] calls that hashed 64 pages or more
++  kRefreshBigPages,     // [ng2 ps5 port] pages those hashed
+   kCount
+ };
+ extern std::atomic<uint64_t> counters[kCount];
+@@ -52,6 +59,12 @@ const char* ObjectTypeName(uint32_t type);
+ // symbolized against the linked ELF offline.
+ void RegisterThread(const char* what);
+ void SampleAllThreads();
++// [ng2 ps5 port] A sampling profile of one thread (the first whose name
++// contains `name`): signalled every millisecond for `seconds`, its rip
++// counted ("self") and every return address on its stack counted once per
++// sample ("on stack", an inclusive profile). Logged as anchor-relative
++// addresses like the samples above. No clock reads in the profiled thread.
++void ProfileThread(const char* name, int seconds);
+ // A host fault no handler took (a crash in some thread): logged with the
+ // thread's return addresses; the thread then re-faults, so it is logged a few
+ // times only.
+diff --git a/include/rex/system/xfile.h b/include/rex/system/xfile.h
+index 6063f3cc..b82a242c 100644
+--- a/include/rex/system/xfile.h
++++ b/include/rex/system/xfile.h
+@@ -66,6 +66,12 @@ class X_FILE_DIRECTORY_INFORMATION {
+   }
+ };
+ 
++// [ng2 ps5 port] Logs a guest file call that took longer than a few
++// milliseconds (rate-limited): the game's own thread waits on these, so a slow
++// one is a hitch. `start_ns` is SlowFileCallClock() taken before the call.
++int64_t SlowFileCallClock();
++void NoteSlowFileCall(const char* what, std::string_view path, uint64_t bytes, int64_t start_ns);
++
+ class XFile : public XObject {
+  public:
+   static const XObject::Type kObjectType = XObject::Type::File;
+diff --git a/include/rex/thread/mutex.h b/include/rex/thread/mutex.h
+index 6e5755a4..83c5f12e 100644
+--- a/include/rex/thread/mutex.h
++++ b/include/rex/thread/mutex.h
+@@ -13,6 +13,8 @@
+ 
+ #include <mutex>
+ 
++#include <rex/platform.h>
++
+ namespace rex::thread {
+ 
+ // The global critical region mutex singleton.
+@@ -57,17 +59,48 @@ class global_critical_region {
+  public:
+   static std::recursive_mutex& mutex();
+ 
++  // [ng2 ps5 port] Locks the mutex, spinning briefly first. The PS5's
++  // recursive mutex never spins: a thread that finds it taken goes straight
++  // to sleep in the kernel, and the holder makes a second system call on
++  // unlock to wake it. Nearly every hold of this lock is a few microseconds
++  // (a handle lookup, an event, page flags), so in heavy scenes the GPU
++  // command thread spent up to a fifth of its time in those sleeps and
++  // wake-ups, not in real waiting. Spinning ~20 us first (a few hundred
++  // try_locks with pauses between them) lets most of them through without
++  // the kernel; a longer hold still ends in the same blocking lock().
++  // Elsewhere the platform's mutex already spins.
++  static void LockMutex() {
++#if REX_PLATFORM_PS5
++    std::recursive_mutex& m = mutex();
++    for (int attempt = 0; attempt < 32; ++attempt) {
++      if (m.try_lock()) {
++        return;
++      }
++      for (int i = 0; i < 32; ++i) {
++#if defined(__x86_64__) || defined(_M_X64)
++        __builtin_ia32_pause();
++#endif
++      }
++    }
++    m.lock();
++#else
++    mutex().lock();
++#endif
++  }
++
+   // Acquires a lock on the global critical section.
+   // Use this when keeping an instance is not possible. Otherwise, prefer
+   // to keep an instance of global_critical_region near the members requiring
+   // it to keep things readable.
+   static std::unique_lock<std::recursive_mutex> AcquireDirect() {
+-    return std::unique_lock<std::recursive_mutex>(mutex());
++    LockMutex();
++    return std::unique_lock<std::recursive_mutex>(mutex(), std::adopt_lock);
+   }
+ 
+   // Acquires a lock on the global critical section.
+   inline std::unique_lock<std::recursive_mutex> Acquire() {
+-    return std::unique_lock<std::recursive_mutex>(mutex());
++    LockMutex();
++    return std::unique_lock<std::recursive_mutex>(mutex(), std::adopt_lock);
+   }
+ 
+   // Acquires a deferred lock on the global critical section.
 diff --git a/include/rex/ui/display_clock.h b/include/rex/ui/display_clock.h
 new file mode 100644
 index 00000000..76b8cd1c
@@ -305,6 +567,52 @@ index fa2ef605..84b1e5f2 100644
  REXCVAR_DECLARE(double, video_mode_refresh_rate);
  REXCVAR_DECLARE(std::string, resolution);
  
+diff --git a/resources/templates/codegen/pch_h.inja b/resources/templates/codegen/pch_h.inja
+index b10adf97..89e980c6 100644
+--- a/resources/templates/codegen/pch_h.inja
++++ b/resources/templates/codegen/pch_h.inja
+@@ -144,6 +144,41 @@ extern PPCFuncMapping PPCFuncMappings[];
+ #define REX_STORE_U32(x, y) (*(volatile u32*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap32(y))
+ #define REX_STORE_U64(x, y) (*(volatile u64*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap64(y))
+ 
++// [ng2 ps5 port] Accesses at r1 + constant: the thread's own stack frame,
++// which no other thread touches. They are not volatile, so the compiler can
++// keep a spilled value in a register, forward a store to the next load and
++// drop redundant ones - every other guest access stays volatile. memcpy (one
++// mov) keeps them free of alignment and strict-aliasing assumptions. Build
++// with -DREX_STACK_ACCESSES_VOLATILE_FALLBACK to make them the volatile
++// macros again (no codegen needed).
++static inline u8 rex_stack_load_u8(const u8* p) { return *p; }
++static inline u16 rex_stack_load_u16(const u8* p) { u16 v; __builtin_memcpy(&v, p, 2); return __builtin_bswap16(v); }
++static inline u32 rex_stack_load_u32(const u8* p) { u32 v; __builtin_memcpy(&v, p, 4); return __builtin_bswap32(v); }
++static inline u64 rex_stack_load_u64(const u8* p) { u64 v; __builtin_memcpy(&v, p, 8); return __builtin_bswap64(v); }
++static inline void rex_stack_store_u8(u8* p, u8 v) { *p = v; }
++static inline void rex_stack_store_u16(u8* p, u16 v) { v = __builtin_bswap16(v); __builtin_memcpy(p, &v, 2); }
++static inline void rex_stack_store_u32(u8* p, u32 v) { v = __builtin_bswap32(v); __builtin_memcpy(p, &v, 4); }
++static inline void rex_stack_store_u64(u8* p, u64 v) { v = __builtin_bswap64(v); __builtin_memcpy(p, &v, 8); }
++#ifdef REX_STACK_ACCESSES_VOLATILE_FALLBACK
++#define REX_STACK_LOAD_U8(x) REX_LOAD_U8(x)
++#define REX_STACK_LOAD_U16(x) REX_LOAD_U16(x)
++#define REX_STACK_LOAD_U32(x) REX_LOAD_U32(x)
++#define REX_STACK_LOAD_U64(x) REX_LOAD_U64(x)
++#define REX_STACK_STORE_U8(x, y) REX_STORE_U8(x, y)
++#define REX_STACK_STORE_U16(x, y) REX_STORE_U16(x, y)
++#define REX_STACK_STORE_U32(x, y) REX_STORE_U32(x, y)
++#define REX_STACK_STORE_U64(x, y) REX_STORE_U64(x, y)
++#else
++#define REX_STACK_LOAD_U8(x) rex_stack_load_u8(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x))
++#define REX_STACK_LOAD_U16(x) rex_stack_load_u16(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x))
++#define REX_STACK_LOAD_U32(x) rex_stack_load_u32(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x))
++#define REX_STACK_LOAD_U64(x) rex_stack_load_u64(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x))
++#define REX_STACK_STORE_U8(x, y) rex_stack_store_u8(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x), (y))
++#define REX_STACK_STORE_U16(x, y) rex_stack_store_u16(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x), (y))
++#define REX_STACK_STORE_U32(x, y) rex_stack_store_u32(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x), (y))
++#define REX_STACK_STORE_U64(x, y) rex_stack_store_u64(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x), (y))
++#endif
++
+ #define REX_MEMORY_SIZE 0x100000000ull
+ 
+ //=============================================================================
 diff --git a/src/audio/ps5/ps5_audio_driver.cpp b/src/audio/ps5/ps5_audio_driver.cpp
 index 3fbc549d..a1ff2e7d 100644
 --- a/src/audio/ps5/ps5_audio_driver.cpp
@@ -346,7 +654,7 @@ index 3fbc549d..a1ff2e7d 100644
    }
  }
 diff --git a/src/codegen/builders/context.cpp b/src/codegen/builders/context.cpp
-index f78e0d8f..7a94390b 100644
+index f78e0d8f..8aace27b 100644
 --- a/src/codegen/builders/context.cpp
 +++ b/src/codegen/builders/context.cpp
 @@ -71,6 +71,12 @@ std::string BuilderContext::f(size_t index) {
@@ -362,6 +670,81 @@ index f78e0d8f..7a94390b 100644
    if ((cfg.nonArgumentRegistersAsLocalVariables && (index >= 32 && index <= 63)) ||
        (localizeNonVolatiles() && ((index >= 14 && index <= 31) || (index >= 64 && index <= 127)))) {
      locals.v[index] = true;
+@@ -501,6 +507,14 @@ void BuilderContext::emit_load_d_form(const char* load_macro, const char* dest_t
+     }
+   }
+ 
++  // [ng2 ps5 port] r1 + constant is the thread's own stack frame: the
++  // non-volatile stack macro (pch: REX_STACK_LOAD_*).
++  static char stack_macro[64];
++  if (macro == load_macro && insn.operands[2] == 1 && strncmp(load_macro, "REX_LOAD_", 9) == 0) {
++    snprintf(stack_macro, sizeof(stack_macro), "REX_STACK_LOAD_%s", load_macro + 9);
++    macro = stack_macro;
++  }
++
+   print("\t{}.{} = {}(", r(insn.operands[0]), dest_type, macro);
+   if (insn.operands[2] != 0)
+     print("{}.u32 + ", r(insn.operands[2]));
+@@ -541,6 +555,13 @@ void BuilderContext::emit_store_d_form(const char* store_macro, const char* src_
+     }
+   }
+ 
++  // [ng2 ps5 port] r1 + constant: the non-volatile stack macro.
++  static char stack_macro[64];
++  if (macro == store_macro && insn.operands[2] == 1 && strncmp(store_macro, "REX_STORE_", 10) == 0) {
++    snprintf(stack_macro, sizeof(stack_macro), "REX_STACK_STORE_%s", store_macro + 10);
++    macro = stack_macro;
++  }
++
+   print("\t{}(", macro);
+   if (insn.operands[2] != 0)
+     print("{}.u32 + ", r(insn.operands[2]));
+diff --git a/src/codegen/builders/memory.cpp b/src/codegen/builders/memory.cpp
+index 3dd7fa56..29e447ad 100644
+--- a/src/codegen/builders/memory.cpp
++++ b/src/codegen/builders/memory.cpp
+@@ -221,7 +221,8 @@ bool build_ldarx(BuilderContext& ctx) {
+ 
+ bool build_lfd(BuilderContext& ctx) {
+   ctx.emit_set_flush_mode(false);
+-  ctx.print("\t{}.u64 = REX_LOAD_U64(", ctx.f(ctx.insn.operands[0]));
++  ctx.print("\t{}.u64 = {}(", ctx.f(ctx.insn.operands[0]),
++            ctx.insn.operands[2] == 1 ? "REX_STACK_LOAD_U64" : "REX_LOAD_U64");  // [ng2 ps5 port] (r1: stack)
+   if (ctx.insn.operands[2] != 0)
+     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[2]));
+   ctx.println("{});", static_cast<int32_t>(ctx.insn.operands[1]));
+@@ -239,7 +240,8 @@ bool build_lfdx(BuilderContext& ctx) {
+ 
+ bool build_lfs(BuilderContext& ctx) {
+   ctx.emit_set_flush_mode(false);
+-  ctx.print("\t{}.u32 = REX_LOAD_U32(", ctx.temp());
++  ctx.print("\t{}.u32 = {}(", ctx.temp(),
++            ctx.insn.operands[2] == 1 ? "REX_STACK_LOAD_U32" : "REX_LOAD_U32");  // [ng2 ps5 port] (r1: stack)
+   if (ctx.insn.operands[2] != 0)
+     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[2]));
+   ctx.println("{});", static_cast<int32_t>(ctx.insn.operands[1]));
+@@ -448,7 +450,9 @@ bool build_stdux(BuilderContext& ctx) {
+ 
+ bool build_stfd(BuilderContext& ctx) {
+   ctx.emit_set_flush_mode(false);
+-  ctx.print("{}", ctx.mmio_check_d_form() ? "\tREX_MM_STORE_U64(" : "\tREX_STORE_U64(");
++  ctx.print("{}", ctx.mmio_check_d_form()       ? "\tREX_MM_STORE_U64("
++                  : ctx.insn.operands[2] == 1 ? "\tREX_STACK_STORE_U64("  // [ng2 ps5 port] (r1: stack)
++                                              : "\tREX_STORE_U64(");
+   if (ctx.insn.operands[2] != 0)
+     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[2]));
+   ctx.println("{}, {}.u64);", static_cast<int32_t>(ctx.insn.operands[1]),
+@@ -487,7 +491,9 @@ bool build_stfiwx(BuilderContext& ctx) {
+ bool build_stfs(BuilderContext& ctx) {
+   ctx.emit_set_flush_mode(false);
+   ctx.println("\t{}.f32 = float({}.f64);", ctx.temp(), ctx.f(ctx.insn.operands[0]));
+-  ctx.print("{}", ctx.mmio_check_d_form() ? "\tREX_MM_STORE_U32(" : "\tREX_STORE_U32(");
++  ctx.print("{}", ctx.mmio_check_d_form()       ? "\tREX_MM_STORE_U32("
++                  : ctx.insn.operands[2] == 1 ? "\tREX_STACK_STORE_U32("  // [ng2 ps5 port] (r1: stack)
++                                              : "\tREX_STORE_U32(");
+   if (ctx.insn.operands[2] != 0)
+     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[2]));
+   ctx.println("{}, {}.u32);", static_cast<int32_t>(ctx.insn.operands[1]), ctx.temp());
 diff --git a/src/codegen/builders/system.cpp b/src/codegen/builders/system.cpp
 index b2d70f53..470d995e 100644
 --- a/src/codegen/builders/system.cpp
@@ -436,12 +819,178 @@ index 1645848c..1beb3a32 100644
  
    int max_seq = 0;
    std::string prefix = std::string(app_name) + "_";
+diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
+index dc5a777e..cd55a396 100644
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -402,6 +402,11 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
+   if (out_old_access) {
+     *out_old_access = PageAccess::kNoAccess;
+   }
++#if REX_PLATFORM_PS5
++  rex::ps5diag::Add(rex::ps5diag::kProtectCalls);  // [ng2 ps5 port] (how many, how big: the diag line)
++  rex::ps5diag::counters[rex::ps5diag::kProtectPages].fetch_add((length + page_size() - 1) / page_size(),
++                                                               std::memory_order_relaxed);
++#endif
+ 
+ #if REX_PLATFORM_MAC
+   // mprotect doesn't report the previous protection. Query the Mach region
+diff --git a/src/core/ps5_diag.cpp b/src/core/ps5_diag.cpp
+index 7d718ffa..6da38770 100644
+--- a/src/core/ps5_diag.cpp
++++ b/src/core/ps5_diag.cpp
+@@ -1,17 +1,21 @@
+ // [ps5 port] see rex/ps5_diag.h
+ #include <rex/ps5_diag.h>
+ 
++#include <algorithm>
+ #include <chrono>
+ #include <cstring>
+ #include <mutex>
+ #include <string>
+ #include <unordered_map>
++#include <vector>
+ 
+ #include <pthread.h>
+ #include <pthread_np.h>
+ #include <signal.h>
+ #include <unistd.h>
+ 
++extern "C" int pthread_getname_np(pthread_t thread, char* name, size_t len);
++
+ #include <rex/logging.h>
+ 
+ namespace rex::ps5diag {
+@@ -145,6 +149,123 @@ void RegisterThread(const char* what) {
+   e.used.store(true, std::memory_order_release);
+ }
+ 
++void ProfileThread(const char* name, int seconds) {
++  static bool installed = false;
++  if (!installed) {
++    struct sigaction sa = {};
++    sa.sa_sigaction = SampleHandler;
++    sa.sa_flags = SA_SIGINFO | SA_RESTART;
++    sigemptyset(&sa.sa_mask);
++    sigaction(SIGPROF, &sa, nullptr);
++    installed = true;
++  }
++  // Threads register as "rex" and are named later (set_name): match the name
++  // they have now.
++  ThreadEntry* target = nullptr;
++  char target_name[32] = {};
++  const int count = std::min(next_thread.load(), kThreads);
++  for (int i = 0; i < count && !target; ++i) {
++    if (!threads[i].used.load(std::memory_order_acquire)) continue;
++    char thread_name[32] = {};
++    if (pthread_getname_np(threads[i].pthread, thread_name, sizeof(thread_name) - 1) != 0) thread_name[0] = '\0';
++    if (std::strstr(thread_name, name) || std::strstr(threads[i].what, name)) {
++      target = &threads[i];
++      std::memcpy(target_name, thread_name[0] ? thread_name : threads[i].what, sizeof(target_name) - 1);
++    }
++  }
++  if (!target) {
++    REXLOG_WARN("ps5 profile: no thread named like '{}'", name);
++    return;
++  }
++  const uintptr_t anchor = Anchor();
++  std::unordered_map<uintptr_t, uint32_t> self, on_stack;
++  // Samples in system code (libkernel, libc: outside the eboot), by where
++  // they are and the two nearest return addresses into our code - which of
++  // our functions made the call (a lock, mprotect, a clock read...).
++  struct Chain {
++    uintptr_t rip, caller, caller2;
++    bool operator==(const Chain& o) const { return rip == o.rip && caller == o.caller && caller2 == o.caller2; }
++  };
++  struct ChainHash {
++    size_t operator()(const Chain& c) const { return c.rip * 31 ^ c.caller * 17 ^ c.caller2; }
++  };
++  std::unordered_map<Chain, uint32_t, ChainHash> system_calls;
++  uint32_t system_samples = 0;
++  uint32_t samples = 0, missed = 0;
++  const int total = seconds * 1000;
++  for (int s = 0; s < total; ++s) {
++    target->done.store(0);
++    if (pthread_kill(target->pthread, SIGPROF) != 0) break;
++    int waited = 0;
++    while (!target->done.load(std::memory_order_acquire) && waited < 40) usleep(50), ++waited;
++    if (!target->done.load(std::memory_order_acquire)) {
++      ++missed;
++      continue;
++    }
++    ++samples;
++    ++self[target->rip];
++    const bool in_eboot = target->rip > (anchor > kNear ? anchor - kNear : 0x10000) && target->rip < anchor + kNear;
++    if (!in_eboot) {
++      ++system_samples;
++      ++system_calls[Chain{target->rip, target->nwords > 0 ? target->words[0] : 0,
++                           target->nwords > 1 ? target->words[1] : 0}];
++    }
++    uintptr_t seen[64];
++    int nseen = 0;
++    for (int k = 0; k < target->nwords; ++k) {
++      const uintptr_t v = target->words[k];
++      bool dup = false;
++      for (int j = 0; j < nseen && !dup; ++j) dup = seen[j] == v;
++      if (!dup) {
++        seen[nseen++] = v;
++        ++on_stack[v];
++      }
++    }
++    usleep(950);
++  }
++  auto top = [&](const std::unordered_map<uintptr_t, uint32_t>& m, const char* label, size_t n) {
++    std::vector<std::pair<uint32_t, uintptr_t>> v;
++    v.reserve(m.size());
++    for (const auto& [a, c] : m) v.emplace_back(c, a);
++    std::sort(v.begin(), v.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
++    if (v.size() > n) v.resize(n);
++    std::string line;
++    for (size_t i = 0; i < v.size(); ++i) {
++      char buf[40];
++      snprintf(buf, sizeof(buf), " %lX:%u", (unsigned long)(v[i].second - anchor + 0x10000000), v[i].first);
++      line += buf;
++      if ((i + 1) % 20 == 0 || i + 1 == v.size()) {
++        REXLOG_INFO("ps5 profile {} {}:{}", target_name, label, line);
++        line.clear();
++      }
++    }
++  };
++  REXLOG_INFO("ps5 profile {}: {} samples in {} s ({} missed); address:count, anchor {:X}", target_name, samples,
++              seconds, missed, anchor);
++  top(self, "self", 150);
++  top(on_stack, "on stack", 80);
++  {
++    std::vector<std::pair<uint32_t, Chain>> v;
++    for (const auto& [c, n] : system_calls) v.emplace_back(n, c);
++    std::sort(v.begin(), v.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
++    if (v.size() > 40) v.resize(40);
++    REXLOG_INFO("ps5 profile {}: {} samples in system code (rip outside the eboot); rip<caller<caller2:count", target_name,
++                system_samples);
++    std::string line;
++    for (size_t i = 0; i < v.size(); ++i) {
++      char buf[72];
++      auto rel = [&](uintptr_t a) { return (unsigned long)(a ? a - anchor + 0x10000000 : 0); };
++      snprintf(buf, sizeof(buf), " %lX<%lX<%lX:%u", rel(v[i].second.rip), rel(v[i].second.caller),
++               rel(v[i].second.caller2), v[i].first);
++      line += buf;
++      if ((i + 1) % 10 == 0 || i + 1 == v.size()) {
++        REXLOG_INFO("ps5 profile {} system calls:{}", target_name, line);
++        line.clear();
++      }
++    }
++  }
++}
++
+ void SampleAllThreads() {
+   static bool installed = false;
+   if (!installed) {
 diff --git a/src/core/ps5_diag_host.cpp b/src/core/ps5_diag_host.cpp
 new file mode 100644
-index 00000000..c3b9506a
+index 00000000..f9d62b49
 --- /dev/null
 +++ b/src/core/ps5_diag_host.cpp
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,31 @@
 +// [ng2 ps5 port] rex/ps5_diag.h on every platform but the PS5 (ps5_diag.cpp
 +// is FreeBSD-only). Shared code fills the counters and wait slots without a
 +// platform guard, so a host build - the codegen tool for a PS5 build is one -
@@ -467,13 +1016,14 @@ index 00000000..c3b9506a
 +const char* ObjectTypeName(uint32_t) { return "object"; }
 +void RegisterThread(const char*) {}
 +void SampleAllThreads() {}
++void ProfileThread(const char*, int) {}
 +void UnhandledHostFault(uintptr_t, uintptr_t, uintptr_t) {}
 +uintptr_t Anchor() { return 0; }
 +void NoteCriticalSectionInit(uint32_t, uint32_t) {}
 +uint32_t CriticalSectionInitBy(uint32_t) { return 0; }
 +}  // namespace rex::ps5diag
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index 651a6e46..c1418f4d 100644
+index 651a6e46..7f5473dc 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -11,6 +11,8 @@
@@ -493,7 +1043,24 @@ index 651a6e46..c1418f4d 100644
  
  REXCVAR_DECLARE(bool, vsync);  // [svr2011] (ui/presenter.cpp: the presenters read it too)
  
-@@ -81,6 +84,9 @@ REXCVAR_DEFINE_INT32(query_occlusion_fake_sample_count, 1000, "GPU",
+@@ -49,6 +52,16 @@ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
+                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++// [ng2 ps5 port] How often the refresh above runs. Every frame it makes the
++// next frame upload (memcpy) and write-protect (mprotect) again every page the
++// CPU had uploaded - every vertex and index buffer in use - which a profile of
++// the PS5's GPU command thread put at ~18% of its time in heavy scenes. Writes
++// the watches see still invalidate at once; only writes they miss (why NG2
++// needs the refresh at all) wait up to this many frames.
++REXCVAR_DEFINE_INT32(clear_memory_page_state_interval, 1, "GPU",
++                     "Run clear_memory_page_state every N frames (1 = every frame)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+@@ -81,6 +94,9 @@ REXCVAR_DEFINE_INT32(query_occlusion_fake_sample_count, 1000, "GPU",
      .range(1, 100000)
      .lifecycle(rex::cvar::Lifecycle::kHotReload);
  
@@ -503,7 +1070,7 @@ index 651a6e46..c1418f4d 100644
  REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
                      "Compile shaders and create pipelines asynchronously in background "
                      "threads. This reduces stutter but may cause brief visual artifacts while "
-@@ -89,6 +95,46 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
+@@ -89,6 +105,46 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
  
  namespace rex::graphics {
  
@@ -550,7 +1117,7 @@ index 651a6e46..c1418f4d 100644
  using namespace rex::graphics::xenos;
  
  namespace {
-@@ -209,6 +255,8 @@ void CommandProcessor::WorkerThreadMain() {
+@@ -209,6 +265,8 @@ void CommandProcessor::WorkerThreadMain() {
      rex::FatalError("Unable to setup command processor internal state");
      return;
    }
@@ -559,7 +1126,7 @@ index 651a6e46..c1418f4d 100644
  
    while (worker_running_) {
      while (!pending_fns_.empty()) {
-@@ -247,7 +295,66 @@ void CommandProcessor::WorkerThreadMain() {
+@@ -247,7 +305,66 @@ void CommandProcessor::WorkerThreadMain() {
  
      // Execute. Note that we handle wraparound transparently.
      rex::ps5diag::Add(rex::ps5diag::kPrimaryBuffers);
@@ -627,7 +1194,7 @@ index 651a6e46..c1418f4d 100644
  
      // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
      //     that many indices.
-@@ -330,7 +437,15 @@ bool CommandProcessor::SetupContext() {
+@@ -330,7 +447,15 @@ bool CommandProcessor::SetupContext() {
  void CommandProcessor::ShutdownContext() {}
  
  void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
@@ -643,7 +1210,7 @@ index 651a6e46..c1418f4d 100644
    primary_buffer_ptr_ = ptr;
    primary_buffer_size_ = uint32_t(1) << (size_log2 + 3);
  }
-@@ -1010,7 +1125,11 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+@@ -1010,7 +1135,11 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
    uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
    reader->AdvanceRead((count - 4) * sizeof(uint32_t));
  
@@ -656,15 +1223,25 @@ index 651a6e46..c1418f4d 100644
  
    ++counter_;
    return true;
-@@ -1046,6 +1165,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -1046,6 +1175,9 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
    const uint64_t wait_start = log_waits ? rex::chrono::Clock::QueryHostTickCount() : 0;
    uint32_t polls = 0;
    const bool trace = rex::timeline::Enabled();
-+  const auto wait_t0 = std::chrono::steady_clock::now();  // [ng2 ps5 port] (busy split)
++  // [ng2 ps5 port] (busy split) Taken when a wait actually has to poll again:
++  // most WAIT_REG_MEMs match at once, and the clock is a system call here.
++  std::chrono::steady_clock::time_point wait_t0{};
  
    bool matched = false;
    do {
-@@ -1118,6 +1238,12 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -1089,6 +1221,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+         break;
+     }
+     if (!matched) {
++      if (polls == 1) wait_t0 = std::chrono::steady_clock::now();  // [ng2 ps5 port]
+       // [svr07] a wait that doesn't end (a game stopped at its first frame):
+       // say what the GPU is waiting for
+       if (polls == 3000 || (polls % 60000) == 0)
+@@ -1118,6 +1251,12 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
      }
    } while (!matched);
    if (trace && polls > 1) rex::timeline::Record(rex::timeline::kGpuWaitEnd, poll_reg_addr, polls);
@@ -677,7 +1254,7 @@ index 651a6e46..c1418f4d 100644
  
    if (log_waits) {
      struct WaitStats {
-@@ -1478,6 +1604,8 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
+@@ -1478,6 +1617,8 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
  
        bool major_mode_explicit =
            xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
@@ -885,18 +1462,59 @@ index 76f5600c..3736ad1c 100644
 +}
 +}  // namespace rex::graphics
 diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
-index ec0df7c8..3bd156f1 100644
+index ec0df7c8..5d1e2726 100644
 --- a/src/graphics/shared_memory.cpp
 +++ b/src/graphics/shared_memory.cpp
-@@ -14,6 +14,7 @@
+@@ -13,13 +13,28 @@
+ #include <cstring>
  #include <utility>
  
++#include <rex/ps5_diag.h>  // [ng2 ps5 port] refresh counters
  #include <rex/assert.h>
++#include <rex/cvar.h>
++#include <rex/hash.h>
 +#include <rex/graphics/ng2_phase_timer.h>
  #include <rex/bit.h>
  #include <rex/dbg.h>
  #include <rex/graphics/shared_memory.h>
-@@ -343,8 +344,11 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+ #include <rex/math.h>
+ #include <rex/memory.h>
+ 
++REXCVAR_DEFINE_INT32(shared_memory_invalidation_widen_kb, 256, "GPU",
++                     "[ng2 ps5 port] At most this much (KB, around the faulting range) a CPU write fault invalidates "
++                     "(the upstream widening assumed 4 KB pages)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_BOOL(shared_memory_verify_refresh, true, "GPU",
++                    "[ng2 ps5 port] After the frame-end memory refresh, re-upload a page only if its content changed")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_BOOL(shared_memory_valid_check_before_lock, true, "GPU",
++                    "[ng2 ps5 port] Skip the global lock in RequestRanges when every requested page is valid")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ namespace rex::graphics {
+ 
+ SharedMemory::SharedMemory(memory::Memory& memory) : memory_(memory) {
+@@ -34,6 +49,8 @@ void SharedMemory::InitializeCommon() {
+   num_system_page_flags_ = ((kBufferSize >> page_size_log2_) + 63) / 64;
+   system_page_flags_valid_.assign(num_system_page_flags_, 0);
+   system_page_flags_valid_and_gpu_written_.assign(num_system_page_flags_, 0);
++  refresh_pending_.assign(num_system_page_flags_, 0);
++  page_hashes_.assign(size_t(kBufferSize >> page_size_log2_), 0);
+ 
+   memory_invalidation_callback_handle_ =
+       memory_.RegisterPhysicalMemoryInvalidationCallback(MemoryInvalidationCallbackThunk, this);
+@@ -102,6 +119,10 @@ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
+ 
+   // Pages that are valid only because the CPU uploaded them lose their valid
+   // bit here, so the next frame re-reads them from guest memory.
++  // [ng2 ps5 port] ...and are remembered as pending, for the verified refresh.
++  for (uint32_t i = 0; i < num_system_page_flags_; ++i) {
++    refresh_pending_[i] |= system_page_flags_valid_[i] & ~system_page_flags_valid_and_gpu_written_[i];
++  }
+   system_page_flags_valid_ = system_page_flags_valid_and_gpu_written_;
+ }
+ 
+@@ -343,8 +364,11 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
    }
  
    // Some texture or buffer is empty, for example - safe to draw in this case.
@@ -910,8 +1528,38 @@ index ec0df7c8..3bd156f1 100644
    for (size_t i = 0; i < count; ++i) {
      uint32_t start = ranges[i].first;
      uint32_t length = ranges[i].second;
-@@ -362,10 +366,12 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+@@ -360,12 +384,42 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+     return true;
+   }
  
++  // [ng2 ps5 port] The usual case on every draw - everything requested is
++  // already valid - checked before the global lock. The GPU thread takes it
++  // here for every index and vertex buffer of every draw (~450,000 times a
++  // second in heavy scenes), and on the PS5 the profile put the lock and
++  // unlock at ~16% of the thread's time. Only this thread sets valid bits;
++  // guest threads only clear them (a CPU write, under the lock), and a write
++  // racing this check was already racing the locked version.
++  if (REXCVAR_GET(shared_memory_valid_check_before_lock)) {
++    bool all_valid = true;
++    for (size_t r = 0; r < merged_ranges.size() && all_valid; ++r) {
++      const uint32_t page_first = merged_ranges[r].first >> page_size_log2_;
++      const uint32_t page_last = (merged_ranges[r].first + merged_ranges[r].second - 1) >> page_size_log2_;
++      for (uint32_t block = page_first >> 6; block <= (page_last >> 6); ++block) {
++        uint64_t wanted = ~uint64_t(0);
++        if (block == (page_first >> 6)) wanted &= ~((uint64_t(1) << (page_first & 63)) - 1);
++        if (block == (page_last >> 6) && (page_last & 63) != 63) wanted &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
++        const uint64_t valid = __atomic_load_n(&system_page_flags_valid_[block], __ATOMIC_RELAXED);
++        if ((valid & wanted) != wanted) {
++          all_valid = false;
++          break;
++        }
++      }
++    }
++    if (all_valid) {
++      return true;
++    }
++  }
++
    SCOPE_profile_cpu_f("gpu");
  
 -  std::sort(merged_ranges.begin(), merged_ranges.end(),
@@ -927,7 +1575,7 @@ index ec0df7c8..3bd156f1 100644
    size_t merged_write = 0;
    for (size_t i = 1; i < merged_ranges.size(); ++i) {
      std::pair<uint32_t, uint32_t>& range_previous = merged_ranges[merged_write];
-@@ -404,7 +410,11 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+@@ -404,7 +458,11 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
      upload_ranges_.emplace_back(page_start, page_count);
    };
    {
@@ -939,8 +1587,144 @@ index ec0df7c8..3bd156f1 100644
      for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
        uint32_t page_first = range.first >> page_size_log2_;
        uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
+@@ -453,6 +511,37 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+         append_upload_range(range_start, page_last + 1 - range_start);
+       }
+     }
++
++    // [ng2 ps5 port] Verified refresh: a page that is only pending (the frame-end
++    // refresh took its valid bit) and whose content hashes as it did when it was
++    // last uploaded is the same as the GPU's copy - mark it valid, no upload.
++    // Everything uploaded gets its hash recorded. Animated data (bone matrices
++    // the game writes where the watches do not see) changes, so it is still
++    // uploaded every frame; static geometry is not.
++    if (REXCVAR_GET(shared_memory_verify_refresh) && !upload_ranges_.empty()) {
++      uint32_t total_pages = 0;
++      for (const auto& range : upload_ranges_) {
++        total_pages += range.second;
++      }
++      verify_hashes_.resize(total_pages);
++      if (total_pages <= kVerifyInLockPages) {
++        HashUploadPages();
++        VerifyUploadPages();
++      } else {
++        // Larger requests hash with the lock released: the hashing was the
++        // longest part of this function's hold, and the game's write faults
++        // wait on the same lock. Safe because the pending bit is checked only
++        // after, under the lock again: a write the watch sees while a page is
++        // being hashed clears that bit first (MemoryInvalidationCallback), so
++        // the page is uploaded rather than trusted. (Only this thread marks
++        // pages valid, so the ranges stay what they were.)
++        global_lock.unlock();
++        HashUploadPages();
++        global_critical_region_.LockMutex();
++        global_lock = std::unique_lock<std::recursive_mutex>(global_critical_region_.mutex(), std::adopt_lock);
++        VerifyUploadPages();
++      }
++    }
+   }
+ 
+   COUNT_profile_set("gpu/shared_memory/request_ranges_count", uint32_t(count));
+@@ -468,6 +557,63 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+   return UploadRanges(upload_ranges_);
+ }
+ 
++// [ng2 ps5 port] Verified refresh, step 1: hash every page of upload_ranges_
++// into verify_hashes_ (with or without the global lock).
++void SharedMemory::HashUploadPages() {
++  const uint32_t page_bytes = uint32_t(1) << page_size_log2_;
++  size_t i = 0;
++  for (const auto& [range_start, range_count] : upload_ranges_) {
++    for (uint32_t page = range_start; page < range_start + range_count; ++page) {
++      verify_hashes_[i++] = XXH3_64bits(memory_.TranslatePhysical(page << page_size_log2_), page_bytes);
++    }
++  }
++}
++
++// Step 2, with the global lock held: a page still pending whose hash is
++// unchanged becomes valid without an upload; the rest are uploaded and their
++// hashes recorded. Replaces upload_ranges_ with what is left to upload.
++void SharedMemory::VerifyUploadPages() {
++  verified_upload_ranges_.clear();
++  auto add_upload_page = [this](uint32_t page) {
++    if (!verified_upload_ranges_.empty()) {
++      auto& last = verified_upload_ranges_.back();
++      if (last.first + last.second == page) {
++        ++last.second;
++        return;
++      }
++    }
++    verified_upload_ranges_.emplace_back(page, 1);
++  };
++  uint32_t hashed_pages = 0, unchanged_pages = 0;
++  size_t i = 0;
++  for (const auto& [range_start, range_count] : upload_ranges_) {
++    hashed_pages += range_count;
++    for (uint32_t page = range_start; page < range_start + range_count; ++page) {
++      const uint64_t bit = uint64_t(1) << (page & 63);
++      const uint64_t hash = verify_hashes_[i++];
++      const bool pending = (refresh_pending_[page >> 6] & bit) != 0;
++      refresh_pending_[page >> 6] &= ~bit;
++      if (pending && hash == page_hashes_[page]) {
++        system_page_flags_valid_[page >> 6] |= bit;
++        ++unchanged_pages;
++        continue;
++      }
++      page_hashes_[page] = hash;
++      add_upload_page(page);
++    }
++  }
++  upload_ranges_.swap(verified_upload_ranges_);
++  // (diag line: how much is hashed, and in what sizes of request)
++  using namespace rex::ps5diag;
++  Add(kRefreshHashCalls);
++  counters[kRefreshHashPages].fetch_add(hashed_pages, std::memory_order_relaxed);
++  counters[kRefreshSkipPages].fetch_add(unchanged_pages, std::memory_order_relaxed);
++  if (hashed_pages >= 64) {
++    Add(kRefreshBigCalls);
++    counters[kRefreshBigPages].fetch_add(hashed_pages, std::memory_order_relaxed);
++  }
++}
++
+ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
+   std::pair<uint32_t, uint32_t> range(start, length);
+   return RequestRanges(&range, 1);
+@@ -514,6 +660,23 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
+       page_last =
+           (page_last & ~uint32_t(63)) + (std::max(rex::tzcnt(gpu_written_end), uint8_t(1)) - 1);
+     }
++    // [ng2 ps5 port] The widening above works in 64-page blocks: 256 KB with
++    // the 4 KB pages it was tuned for, but 1 MB with the PS5's 16 KB pages -
++    // every write fault then took up to a megabyte out of the GPU's copy, to
++    // be uploaded, hashed and write-protected again in three views (~14,000
++    // mprotect calls a second in a heavy scene). Clamp it to the intended
++    // size around the faulting range.
++    const uint32_t max_bytes = uint32_t(std::max(0, REXCVAR_GET(shared_memory_invalidation_widen_kb))) << 10;
++    uint32_t group_pages = std::max(uint32_t(1), max_bytes >> page_size_log2_);
++    group_pages = uint32_t(1) << (31 - rex::lzcnt(group_pages));  // (a power of two, for the masks)
++    if (group_pages < 64) {
++      const uint32_t fault_first = physical_address_start >> page_size_log2_;
++      const uint32_t fault_last = physical_address_last >> page_size_log2_;
++      page_first = std::max(page_first, fault_first & ~(group_pages - 1));
++      page_last = std::min(page_last, fault_last | (group_pages - 1));
++      page_first = std::min(page_first, fault_first);
++      page_last = std::max(page_last, fault_last);
++    }
+   }
+ 
+   for (uint32_t i = block_first; i <= block_last; ++i) {
+@@ -526,6 +689,9 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
+     }
+     system_page_flags_valid_[i] &= ~invalidate_bits;
+     system_page_flags_valid_and_gpu_written_[i] &= ~invalidate_bits;
++    // [ng2 ps5 port] A write the watch saw: upload it normally (which also
++    // protects the page again), never just verify it.
++    refresh_pending_[i] &= ~invalidate_bits;
+   }
+ 
+   FireWatches(page_first, page_last, false);
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 0bbb0267..afb8f0b0 100644
+index 0bbb0267..3ecacc41 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -11,10 +11,15 @@
@@ -969,17 +1753,29 @@ index 0bbb0267..afb8f0b0 100644
  #include <rex/external_frame.h>
  #include <rex/dbg.h>
  #include <rex/logging.h>
-@@ -48,6 +55,9 @@
+@@ -48,6 +55,21 @@
  #include <rex/ui/vulkan/util.h>
  
  // Legacy backend compatibility aliases for shared readback controls.
++REXCVAR_DEFINE_BOOL(vulkan_async_submission, false, "GPU/Vulkan",
++                    "[ng2 ps5 port] Replay and submit non-swap submissions on a worker thread (WWE 2K14 Recomp's 0026, "
++                    "reduced)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_INT32(vulkan_async_submission_split_draws, 600, "GPU/Vulkan",
++                     "[ng2 ps5 port] With vulkan_async_submission: end the submission after this many draws (0 = only "
++                     "at frame end), so most of a frame reaches the worker before the inline swap submission")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_BOOL(vulkan_texture_descriptor_reuse, false, "GPU/Vulkan",
++                    "[ng2 ps5 port] Bind the previous draw's texture descriptor set again when its images and "
++                    "samplers are unchanged (less CPU per draw; WWE 2K14 Recomp's 0025)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 +REXCVAR_DEFINE_BOOL(ng2_remove_screen_flash, false, "GPU/Vulkan",
 +                    "[ng2 ps5 port] Skip the full-screen white flash some moves draw (the Flying Swallow's)")
 +    .lifecycle(rex::cvar::Lifecycle::kHotReload);
  REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                      "Read render-to-texture results on the CPU")
      .lifecycle(rex::cvar::Lifecycle::kHotReload);
-@@ -56,6 +66,24 @@ REXCVAR_DEFINE_BOOL(vulkan_readback_memexport, false, "GPU/Vulkan",
+@@ -56,6 +78,24 @@ REXCVAR_DEFINE_BOOL(vulkan_readback_memexport, false, "GPU/Vulkan",
                      "Read data written by memory export in shaders on the CPU")
      .lifecycle(rex::cvar::Lifecycle::kHotReload);
  
@@ -1004,7 +1800,7 @@ index 0bbb0267..afb8f0b0 100644
  REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
                      "When async shader compilation is enabled, skip presenting frames that "
                      "used placeholder pipelines to avoid visible flashing")
-@@ -70,10 +98,33 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
+@@ -70,10 +110,47 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                      "device (falls back to render passes otherwise)")
      .lifecycle(rex::cvar::Lifecycle::kHotReload);
  
@@ -1016,6 +1812,20 @@ index 0bbb0267..afb8f0b0 100644
  
  namespace {
  
++bool DescriptorImageInfosEqual(const std::vector<VkDescriptorImageInfo>& left,
++                               const VkDescriptorImageInfo* right, size_t right_count) {
++  if (left.size() != right_count) {
++    return false;
++  }
++  for (size_t i = 0; i < right_count; ++i) {
++    if (left[i].sampler != right[i].sampler || left[i].imageView != right[i].imageView ||
++        left[i].imageLayout != right[i].imageLayout) {
++      return false;
++    }
++  }
++  return true;
++}
++
 +// [ps5 port] Copies the float constants a shader uses, one memcpy per run of
 +// consecutive constants instead of one per constant; the same bytes in the
 +// same order (WWE 2K14 Recomp's 0041, BSD-3, PromethenDev).
@@ -1038,7 +1848,23 @@ index 0bbb0267..afb8f0b0 100644
  // glslang default built-in resource limits.
  constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
      /* .maxLights = */ 32,
-@@ -3665,6 +3716,175 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
+@@ -1921,6 +1998,7 @@ bool VulkanCommandProcessor::SetupContext() {
+ 
+ void VulkanCommandProcessor::ShutdownContext() {
+   AwaitAllQueueOperationsCompletion();
++  StopAsyncSubmit();  // [ng2 ps5 port] (drained by the wait above)
+   InvalidateAllVertexBufferResidency();
+   ShutdownOcclusionQueryResources();
+ 
+@@ -2041,6 +2119,7 @@ void VulkanCommandProcessor::ShutdownContext() {
+   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
+                                          shared_memory_and_edram_descriptor_pool_);
+ 
++  InvalidateTextureDescriptorSetReuse();  // [ng2 ps5 port]
+   texture_cache_.reset();
+ 
+   pipeline_cache_.reset();
+@@ -3665,6 +3744,175 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
    return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
  }
  
@@ -1214,7 +2040,7 @@ index 0bbb0267..afb8f0b0 100644
  bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                         IndexBufferInfo* index_buffer_info,
                                         bool major_mode_explicit) {
-@@ -3691,6 +3911,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3691,6 +3939,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
    if (edram_mode == xenos::EdramMode::kCopy) {
      // Special copy handling.
@@ -1222,7 +2048,26 @@ index 0bbb0267..afb8f0b0 100644
      return IssueCopy();
    }
  
-@@ -3798,7 +4019,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3786,6 +4035,18 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     }
+   }
+ 
++  // [ng2 ps5 port] With asynchronous submission, most frames would record
++  // everything into the one swap submission, which stays inline (the presenter
++  // depends on its queue order). Ending the submission every N draws hands
++  // most of the frame to the worker as it goes. (On the FSI path, EDRAM is a
++  // storage buffer, so the extra render pass breaks are cheap.)
++  if (submission_open_ && REXCVAR_GET(vulkan_async_submission)) {
++    const int split_draws = REXCVAR_GET(vulkan_async_submission_split_draws);
++    if (split_draws > 0 && ++draws_in_submission_ >= uint32_t(split_draws)) {
++      EndSubmission(false);
++    }
++  }
++
+   // Two iterations because a submission (even the current one - in which case
+   // it needs to be ended, and a new one must be started) may need to be awaited
+   // in case of a sampler count overflow, and if that happens, all subsystem
+@@ -3798,7 +4059,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
      }
  
      // Process primitives.
@@ -1236,7 +2081,7 @@ index 0bbb0267..afb8f0b0 100644
        return draw_fail("primitive_processing");
      }
      if (!primitive_processing_result.host_draw_vertex_count) {
-@@ -3919,18 +4145,32 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3919,18 +4185,32 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
        pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
                     : 0;
  
@@ -1272,7 +2117,21 @@ index 0bbb0267..afb8f0b0 100644
      return draw_fail("render_target_update");
    }
  
-@@ -4063,7 +4303,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3984,6 +4264,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+         descriptor_sets_kept = std::min(
+             descriptor_sets_kept, uint32_t(SpirvShaderTranslator::kDescriptorSetTexturesPixel));
+       }
++      // [ng2 ps5 port] Sets past the compatible ones no longer hold valid
++      // values for the new layout. (Harmless before texture sets were reused:
++      // UpdateBindings rewrote them on every draw.)
++      current_graphics_descriptor_set_values_up_to_date_ &=
++          descriptor_sets_kept >= sizeof(current_graphics_descriptor_set_values_up_to_date_) * CHAR_BIT
++              ? UINT32_MAX
++              : (UINT32_C(1) << descriptor_sets_kept) - 1;
+     } else {
+       // No or unknown pipeline layout previously bound - all bindings are in an
+       // indeterminate state.
+@@ -4063,7 +4350,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
  
    // Update uniform buffers and descriptor sets after binding the pipeline with
    // the new layout.
@@ -1286,7 +2145,7 @@ index 0bbb0267..afb8f0b0 100644
      return draw_fail("update_bindings");
    }
  
-@@ -4271,6 +4516,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4271,6 +4563,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
      }
    }
  
@@ -1294,7 +2153,7 @@ index 0bbb0267..afb8f0b0 100644
    return true;
  }
  
-@@ -4471,6 +4717,128 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
+@@ -4471,6 +4764,128 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
    return true;
  }
  
@@ -1423,7 +2282,7 @@ index 0bbb0267..afb8f0b0 100644
  bool VulkanCommandProcessor::IssueCopy() {
  #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
    SCOPE_profile_cpu_f("gpu");
-@@ -4485,9 +4853,13 @@ bool VulkanCommandProcessor::IssueCopy() {
+@@ -4485,9 +4900,13 @@ bool VulkanCommandProcessor::IssueCopy() {
  
    ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
    if (readback_mode == ReadbackResolveMode::kDisabled) {
@@ -1440,7 +2299,33 @@ index 0bbb0267..afb8f0b0 100644
    }
  
    return IssueCopy_ReadbackResolvePath();
-@@ -5063,9 +5435,17 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+@@ -5057,15 +5476,43 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+ 
+   size_t fences_total = submissions_in_flight_fences_.size();
+   size_t fences_awaited = 0;
++  // [ng2 ps5 port] With asynchronous submission, a fence in flight may not
++  // have been passed to vkQueueSubmit yet: a blocking wait lets the worker
++  // finish first, and the polls below stop at the last submitted one.
++  if (await_submission > submission_completed_) {
++    DrainAsyncSubmit();
++    // A submit the worker failed never signals its fence: waiting would hang.
++    if (const int async_error = async_submit_error_.exchange(0)) {
++      REXGPU_ERROR("Failed to submit a Vulkan command buffer (asynchronous submission, VkResult {})", async_error);
++      device_lost_ = true;
++      if (graphics_system_) {
++        graphics_system_->OnHostGpuLossFromAnyThread(true);
++      }
++      return;
++    }
++  } else {
++    const uint64_t submitted_through = AsyncSubmittedThrough();
++    if (submitted_through < submission_completed_ + fences_total) {
++      fences_total = size_t(submitted_through > submission_completed_ ? submitted_through - submission_completed_ : 0);
++    }
++  }
+   if (await_submission > submission_completed_) {
+     // Await in a blocking way if requested.
+     // TODO(Triang3l): Await only one fence. "Fence signal operations that are
      // defined by vkQueueSubmit additionally include in the first
      // synchronization scope all commands that occur earlier in submission
      // order."
@@ -1458,7 +2343,17 @@ index 0bbb0267..afb8f0b0 100644
      if (wait_result == VK_SUCCESS) {
        fences_awaited += await_submission - submission_completed_;
      } else {
-@@ -5323,6 +5703,10 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -5197,6 +5644,9 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+   if (submission_open_ && !is_opening_frame) {
+     return true;
+   }
++  if (!submission_open_) {
++    InvalidateTextureDescriptorSetReuse();  // [ng2 ps5 port]
++  }
+ 
+   // Check the fence - needed for all kinds of submissions (to reclaim transient
+   // resources early) and specifically for frames (not to queue too many), and
+@@ -5323,6 +5773,10 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
  }
  
  bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
@@ -1469,7 +2364,206 @@ index 0bbb0267..afb8f0b0 100644
    const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
    const VkDevice device = vulkan_device->device();
-@@ -6552,16 +6936,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -5463,12 +5917,77 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+ 
+     SubmitBarriers(true);
+ 
++    // [ng2 ps5 port] A failed asynchronous submit, seen here.
++    if (const int async_error = async_submit_error_.exchange(0)) {
++      REXGPU_ERROR("Failed to submit a Vulkan command buffer (asynchronous submission, VkResult {})", async_error);
++      if (VkResult(async_error) == VK_ERROR_DEVICE_LOST && !device_lost_) {
++        device_lost_ = true;
++        if (graphics_system_) {
++          graphics_system_->OnHostGpuLossFromAnyThread(true);
++        }
++      }
++      return false;
++    }
++    // Swap submissions stay inline (the presenter follows them); everything
++    // before must reach the queue first.
++    const bool async_submission = !is_swap && REXCVAR_GET(vulkan_async_submission);
++    if (!async_submission) {
++      DrainAsyncSubmit();
++    }
++
+     assert_false(command_buffers_writable_.empty());
+     CommandBuffer command_buffer = command_buffers_writable_.back();
+     if (dfn.vkResetCommandPool(device, command_buffer.pool, 0) != VK_SUCCESS) {
+       REXGPU_ERROR("Failed to reset a Vulkan command pool");
+       return false;
+     }
++    if (async_submission) {
++      assert_false(fences_free_.empty());
++      VkFence async_fence = fences_free_.back();
++      if (dfn.vkResetFences(device, 1, &async_fence) != VK_SUCCESS) {
++        REXGPU_ERROR("Failed to reset a Vulkan submission fence");
++        return false;
++      }
++      AsyncSubmitJob job;
++      job.command_buffer = command_buffer;
++      job.fence = async_fence;
++      job.submission = GetCurrentSubmission();
++      job.wait_semaphores = current_submission_wait_semaphores_;
++      job.wait_stage_masks = current_submission_wait_stage_masks_;
++      {
++        std::lock_guard lock(async_submit_mutex_);
++        if (!async_submit_free_streams_.empty()) {
++          job.stream = std::move(async_submit_free_streams_.back());
++          async_submit_free_streams_.pop_back();
++        }
++      }
++      if (!job.stream) {
++        job.stream = std::make_unique<DeferredCommandBuffer>(*this);
++      }
++      job.stream->SwapStream(deferred_command_buffer_);
++      if (!async_submit_thread_.joinable()) {
++        async_submit_stop_ = false;
++        async_submit_thread_ = std::thread([this] { AsyncSubmitWorkerMain(); });
++      }
++      {
++        std::lock_guard lock(async_submit_mutex_);
++        async_submit_last_enqueued_ = job.submission;
++        async_submit_jobs_.push_back(std::move(job));
++      }
++      async_submit_cv_.notify_one();
++      // The bookkeeping below is the same as for an inline submission.
++      uint64_t submission_current = GetCurrentSubmission();
++      current_submission_wait_stage_masks_.clear();
++      for (VkSemaphore semaphore : current_submission_wait_semaphores_) {
++        submissions_in_flight_semaphores_.emplace_back(submission_current, semaphore);
++      }
++      current_submission_wait_semaphores_.clear();
++      command_buffers_submitted_.emplace_back(submission_current, command_buffer);
++      command_buffers_writable_.pop_back();
++      submissions_in_flight_fences_.push_back(async_fence);
++      fences_free_.pop_back();
++      submission_open_ = false;
++    } else {
+     VkCommandBufferBeginInfo command_buffer_begin_info;
+     command_buffer_begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+     command_buffer_begin_info.pNext = nullptr;
+@@ -5535,11 +6054,19 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+     fences_free_.pop_back();
+ 
+     submission_open_ = false;
++    }  // (inline submission)
+   }
+ 
++  InvalidateTextureDescriptorSetReuse();  // [ng2 ps5 port]
++  draws_in_submission_ = 0;
++
+   if (is_closing_frame) {
+     if (REXCVAR_GET(clear_memory_page_state) && shared_memory_) {
+-      shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
++      // [ng2 ps5 port] every N frames (clear_memory_page_state_interval)
++      const uint64_t interval = uint64_t(std::max(1, REXCVAR_GET(clear_memory_page_state_interval)));
++      if (frame_current_ % interval == 0) {
++        shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
++      }
+     }
+     frame_open_ = false;
+     // Submission already closed now, so minus 1.
+@@ -5582,6 +6109,8 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+ }
+ 
+ void VulkanCommandProcessor::ClearTransientDescriptorPools() {
++  ++texture_descriptor_allocator_generation_;  // [ng2 ps5 port]
++  InvalidateTextureDescriptorSetReuse();
+   texture_transient_descriptor_sets_free_.clear();
+   texture_transient_descriptor_sets_used_.clear();
+   transient_descriptor_allocator_textures_.Reset();
+@@ -5597,6 +6126,90 @@ void VulkanCommandProcessor::ClearTransientDescriptorPools() {
+   transient_descriptor_allocator_uniform_buffer_.Reset();
+ }
+ 
++uint64_t VulkanCommandProcessor::AsyncSubmittedThrough() const {
++  // Nothing queued since the worker's last submit: everything is submitted.
++  const uint64_t through = async_submitted_through_.load(std::memory_order_acquire);
++  std::lock_guard lock(async_submit_mutex_);
++  return (async_submit_jobs_.empty() && !async_submit_busy_) ? UINT64_MAX : through;
++}
++
++void VulkanCommandProcessor::DrainAsyncSubmit() {
++  if (!async_submit_thread_.joinable()) {
++    return;
++  }
++  std::unique_lock lock(async_submit_mutex_);
++  async_submit_idle_cv_.wait(lock, [this] { return async_submit_jobs_.empty() && !async_submit_busy_; });
++}
++
++void VulkanCommandProcessor::StopAsyncSubmit() {
++  if (!async_submit_thread_.joinable()) {
++    return;
++  }
++  {
++    std::lock_guard lock(async_submit_mutex_);
++    async_submit_stop_ = true;
++  }
++  async_submit_cv_.notify_one();
++  async_submit_thread_.join();
++  async_submit_free_streams_.clear();
++}
++
++void VulkanCommandProcessor::AsyncSubmitWorkerMain() {
++  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  for (;;) {
++    AsyncSubmitJob job;
++    {
++      std::unique_lock lock(async_submit_mutex_);
++      async_submit_cv_.wait(lock, [this] { return async_submit_stop_ || !async_submit_jobs_.empty(); });
++      if (async_submit_jobs_.empty()) {
++        return;  // stop requested, nothing left
++      }
++      job = std::move(async_submit_jobs_.front());
++      async_submit_jobs_.pop_front();
++      async_submit_busy_ = true;
++    }
++    VkResult result = VK_SUCCESS;
++    VkCommandBufferBeginInfo begin_info = {};
++    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
++    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++    result = dfn.vkBeginCommandBuffer(job.command_buffer.buffer, &begin_info);
++    if (result == VK_SUCCESS) {
++      job.stream->Execute(job.command_buffer.buffer);
++      result = dfn.vkEndCommandBuffer(job.command_buffer.buffer);
++    }
++    if (result == VK_SUCCESS) {
++      VkSubmitInfo submit_info = {};
++      submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
++      submit_info.waitSemaphoreCount = uint32_t(job.wait_semaphores.size());
++      submit_info.pWaitSemaphores = job.wait_semaphores.empty() ? nullptr : job.wait_semaphores.data();
++      submit_info.pWaitDstStageMask = job.wait_stage_masks.empty() ? nullptr : job.wait_stage_masks.data();
++      submit_info.commandBufferCount = 1;
++      submit_info.pCommandBuffers = &job.command_buffer.buffer;
++      ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
++          vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
++      result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, job.fence);
++    }
++    if (result != VK_SUCCESS) {
++      async_submit_error_.store(int(result));
++    }
++    job.stream->Reset();
++    {
++      std::lock_guard lock(async_submit_mutex_);
++      async_submitted_through_.store(job.submission, std::memory_order_release);
++      async_submit_free_streams_.push_back(std::move(job.stream));
++      async_submit_busy_ = false;
++    }
++    async_submit_idle_cv_.notify_all();
++  }
++}
++
++void VulkanCommandProcessor::InvalidateTextureDescriptorSetReuse() {
++  for (TextureDescriptorSetReuse& reuse : texture_descriptor_set_reuse_) {
++    reuse = TextureDescriptorSetReuse();
++  }
++}
++
+ void VulkanCommandProcessor::SplitPendingBarrier() {
+   size_t pending_buffer_memory_barrier_count = pending_barriers_buffer_memory_barriers_.size();
+   size_t pending_image_memory_barrier_count = pending_barriers_image_memory_barriers_.size();
+@@ -6552,16 +7165,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
        }
        buffer_info.range = VkDeviceSize(float_constants_size);
        for (uint32_t i = 0; i < 4; ++i) {
@@ -1488,7 +2582,7 @@ index 0bbb0267..afb8f0b0 100644
        }
        current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                                << SpirvShaderTranslator::kConstantBufferFloatVertex;
-@@ -6581,16 +6957,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -6581,16 +7186,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
        }
        buffer_info.range = VkDeviceSize(float_constants_size);
        for (uint32_t i = 0; i < 4; ++i) {
@@ -1507,6 +2601,161 @@ index 0bbb0267..afb8f0b0 100644
        }
        current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                                << SpirvShaderTranslator::kConstantBufferFloatPixel;
+@@ -6652,32 +7249,20 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+     sampler_count_pixel = 0;
+     texture_count_pixel = 0;
+   }
+-  // TODO(Triang3l): Reuse texture and sampler bindings if not changed.
+-  current_graphics_descriptor_set_values_up_to_date_ &=
+-      ~((UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex) |
+-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
+-
+-  // Make sure new descriptor sets are bound to the command buffer.
++  const uint32_t descriptor_set_textures_vertex_bit =
++      UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex;
++  const uint32_t descriptor_set_textures_pixel_bit =
++      UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel;
+ 
+-  current_graphics_descriptor_sets_bound_up_to_date_ &=
+-      current_graphics_descriptor_set_values_up_to_date_;
+-
+-  // Fill the texture and sampler write image infos.
+-
+-  bool write_vertex_textures =
+-      (texture_count_vertex || sampler_count_vertex) &&
+-      !(current_graphics_descriptor_set_values_up_to_date_ &
+-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex));
+-  bool write_pixel_textures =
+-      (texture_count_pixel || sampler_count_pixel) &&
+-      !(current_graphics_descriptor_set_values_up_to_date_ &
+-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
++  // [ng2 ps5 port] Fill the effective texture and sampler image infos of both
++  // stages first (the null-view fallback, the layout and the samplers that
++  // would be written), then decide whether a set can be reused
++  // (vulkan_texture_descriptor_reuse; WWE 2K14 Recomp's 0025).
+   descriptor_write_image_info_.clear();
+   descriptor_write_image_info_.reserve(
+-      (write_vertex_textures ? texture_count_vertex + sampler_count_vertex : 0) +
+-      (write_pixel_textures ? texture_count_pixel + sampler_count_pixel : 0));
++      texture_count_vertex + sampler_count_vertex + texture_count_pixel + sampler_count_pixel);
+   size_t vertex_texture_image_info_offset = descriptor_write_image_info_.size();
+-  if (write_vertex_textures && texture_count_vertex) {
++  if (texture_count_vertex) {
+     for (const VulkanShader::TextureBinding& texture_binding : textures_vertex) {
+       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
+       descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
+@@ -6689,7 +7274,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+     }
+   }
+   size_t vertex_sampler_image_info_offset = descriptor_write_image_info_.size();
+-  if (write_vertex_textures && sampler_count_vertex) {
++  if (sampler_count_vertex) {
+     for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
+          current_samplers_vertex_) {
+       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
+@@ -6697,7 +7282,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+     }
+   }
+   size_t pixel_texture_image_info_offset = descriptor_write_image_info_.size();
+-  if (write_pixel_textures && texture_count_pixel) {
++  if (texture_count_pixel) {
+     for (const VulkanShader::TextureBinding& texture_binding : *textures_pixel) {
+       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
+       descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
+@@ -6709,7 +7294,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+     }
+   }
+   size_t pixel_sampler_image_info_offset = descriptor_write_image_info_.size();
+-  if (write_pixel_textures && sampler_count_pixel) {
++  if (sampler_count_pixel) {
+     for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
+          current_samplers_pixel_) {
+       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
+@@ -6717,6 +7302,54 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+     }
+   }
+ 
++  const VkDescriptorSetLayout texture_descriptor_set_layout_vertex =
++      current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_vertex_ref();
++  const VkDescriptorSetLayout texture_descriptor_set_layout_pixel =
++      current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_pixel_ref();
++  const uint64_t current_submission = GetCurrentSubmission();
++  const bool texture_descriptor_set_reuse_enabled = REXCVAR_GET(vulkan_texture_descriptor_reuse);
++  auto try_reuse_texture_descriptor_set = [&](size_t reuse_index, uint32_t descriptor_set_index,
++                                              VkDescriptorSetLayout descriptor_set_layout,
++                                              const VkDescriptorImageInfo* image_infos,
++                                              size_t image_info_count) {
++    if (!texture_descriptor_set_reuse_enabled || !image_info_count) {
++      return false;
++    }
++    const TextureDescriptorSetReuse& reuse = texture_descriptor_set_reuse_[reuse_index];
++    if (!reuse.valid || reuse.set == VK_NULL_HANDLE || reuse.layout != descriptor_set_layout ||
++        reuse.frame != frame_current_ || reuse.submission != current_submission ||
++        reuse.allocator_generation != texture_descriptor_allocator_generation_ ||
++        !DescriptorImageInfosEqual(reuse.image_infos, image_infos, image_info_count)) {
++      return false;
++    }
++    current_graphics_descriptor_sets_[descriptor_set_index] = reuse.set;
++    current_graphics_descriptor_set_values_up_to_date_ |= UINT32_C(1) << descriptor_set_index;
++    return true;
++  };
++  const bool reuse_vertex_textures = try_reuse_texture_descriptor_set(
++      0, SpirvShaderTranslator::kDescriptorSetTexturesVertex, texture_descriptor_set_layout_vertex,
++      descriptor_write_image_info_.data() + vertex_texture_image_info_offset,
++      texture_count_vertex + sampler_count_vertex);
++  const bool reuse_pixel_textures = try_reuse_texture_descriptor_set(
++      1, SpirvShaderTranslator::kDescriptorSetTexturesPixel, texture_descriptor_set_layout_pixel,
++      descriptor_write_image_info_.data() + pixel_texture_image_info_offset,
++      texture_count_pixel + sampler_count_pixel);
++  if (!reuse_vertex_textures) {
++    current_graphics_descriptor_set_values_up_to_date_ &= ~descriptor_set_textures_vertex_bit;
++  }
++  if (!reuse_pixel_textures) {
++    current_graphics_descriptor_set_values_up_to_date_ &= ~descriptor_set_textures_pixel_bit;
++  }
++
++  // Make sure new descriptor sets are bound to the command buffer.
++  current_graphics_descriptor_sets_bound_up_to_date_ &=
++      current_graphics_descriptor_set_values_up_to_date_;
++
++  const bool write_vertex_textures =
++      (texture_count_vertex || sampler_count_vertex) && !reuse_vertex_textures;
++  const bool write_pixel_textures =
++      (texture_count_pixel || sampler_count_pixel) && !reuse_pixel_textures;
++
+   // Write the new descriptor sets.
+ 
+   // Consecutive bindings updated via a single VkWriteDescriptorSet must have
+@@ -6804,6 +7437,29 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+     dfn.vkUpdateDescriptorSets(device, write_descriptor_set_count, write_descriptor_sets.data(), 0,
+                                nullptr);
+   }
++  // [ng2 ps5 port] Remember the texture sets just written, for reuse.
++  if (texture_descriptor_set_reuse_enabled) {
++    auto remember = [&](size_t reuse_index, uint32_t descriptor_set_index, VkDescriptorSetLayout layout,
++                        size_t offset, size_t count) {
++      TextureDescriptorSetReuse& reuse = texture_descriptor_set_reuse_[reuse_index];
++      reuse.layout = layout;
++      reuse.set = current_graphics_descriptor_sets_[descriptor_set_index];
++      reuse.frame = frame_current_;
++      reuse.submission = current_submission;
++      reuse.allocator_generation = texture_descriptor_allocator_generation_;
++      reuse.image_infos.assign(descriptor_write_image_info_.data() + offset,
++                               descriptor_write_image_info_.data() + offset + count);
++      reuse.valid = true;
++    };
++    if (write_descriptor_set_bits & descriptor_set_textures_vertex_bit) {
++      remember(0, SpirvShaderTranslator::kDescriptorSetTexturesVertex, texture_descriptor_set_layout_vertex,
++               vertex_texture_image_info_offset, texture_count_vertex + sampler_count_vertex);
++    }
++    if (write_descriptor_set_bits & descriptor_set_textures_pixel_bit) {
++      remember(1, SpirvShaderTranslator::kDescriptorSetTexturesPixel, texture_descriptor_set_layout_pixel,
++               pixel_texture_image_info_offset, texture_count_pixel + sampler_count_pixel);
++    }
++  }
+   // Only make valid if all descriptor sets have been allocated and written
+   // successfully.
+   current_graphics_descriptor_set_values_up_to_date_ |= write_descriptor_set_bits;
 diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
 index 91ac08f6..773af940 100644
 --- a/src/graphics/vulkan/pipeline_cache.cpp
@@ -1551,6 +2800,50 @@ index 91ac08f6..773af940 100644
    if (create_result != VK_SUCCESS) {
      uint64_t ps_hash = creation_arguments.pixel_shader
                             ? creation_arguments.pixel_shader->shader().ucode_data_hash()
+diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+index ecbd940d..952cfc4f 100644
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -1897,8 +1897,13 @@ VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed, uint32_t
+   view_key.is_array = uint32_t(is_array);
+ 
+   // Try to find an existing view.
++  if (last_view_ != VK_NULL_HANDLE && view_key == last_view_key_) {
++    return last_view_;
++  }
+   auto it = views_.find(view_key);
+   if (it != views_.end()) {
++    last_view_key_ = view_key;
++    last_view_ = it->second;
+     return it->second;
+   }
+ 
+@@ -1941,6 +1946,8 @@ VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed, uint32_t
+     return VK_NULL_HANDLE;
+   }
+   views_.emplace(view_key, view);
++  last_view_key_ = view_key;
++  last_view_ = view;
+   return view;
+ }
+ 
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_io.cpp b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+index 3f1a8520..78966f9c 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_io.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+@@ -145,10 +145,12 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
+   // Attempt open (or create).
+   rex::filesystem::File* vfs_file;
+   rex::filesystem::FileAction file_action;
++  const int64_t open_start_ns = SlowFileCallClock();
+   X_STATUS result = REX_KERNEL_FS()->OpenFile(
+       root_entry, target_path, rex::filesystem::FileDisposition((uint32_t)creation_disposition),
+       desired_access, (create_options & CreateOptions::FILE_DIRECTORY_FILE) != 0,
+       (create_options & CreateOptions::FILE_NON_DIRECTORY_FILE) != 0, &vfs_file, &file_action);
++  NoteSlowFileCall("open", target_path, 0, open_start_ns);
+   object_ref<XFile> file = nullptr;
+ 
+   X_HANDLE handle = X_INVALID_HANDLE_VALUE;
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
 index cf9a92ad..f479d9b0 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
@@ -1628,6 +2921,183 @@ index 171546fb..16ca9b52 100644
      return result;
    }
  
+diff --git a/src/system/util/object_table.cpp b/src/system/util/object_table.cpp
+index 6fbabd2c..f102b765 100644
+--- a/src/system/util/object_table.cpp
++++ b/src/system/util/object_table.cpp
+@@ -275,7 +275,7 @@ XObject* ObjectTable::LookupObject(X_HANDLE handle, bool already_locked) {
+ 
+   XObject* object = nullptr;
+   if (!already_locked) {
+-    global_critical_region_.mutex().lock();
++    global_critical_region_.LockMutex();  // [ng2 ps5 port] (spins briefly first)
+   }
+ 
+   // Lower 2 bits are ignored.
+diff --git a/src/system/xfile.cpp b/src/system/xfile.cpp
+index 4179e8b2..77712a5e 100644
+--- a/src/system/xfile.cpp
++++ b/src/system/xfile.cpp
+@@ -19,10 +19,34 @@
+ #include <rex/system/xfile.h>
+ #include <rex/thread/mutex.h>
+ 
++#include <algorithm>
++#include <atomic>
++#include <chrono>
+ #include <span>
+ 
+ namespace rex::system {
+ 
++int64_t SlowFileCallClock() {
++  return std::chrono::duration_cast<std::chrono::nanoseconds>(
++             std::chrono::steady_clock::now().time_since_epoch())
++      .count();
++}
++
++void NoteSlowFileCall(const char* what, std::string_view path, uint64_t bytes, int64_t start_ns) {
++  const int64_t ns = SlowFileCallClock() - start_ns;
++  if (ns < 4'000'000) {
++    return;
++  }
++  // The first 40 in full, then every 50th, so a stream of slow reads cannot
++  // flood the log (each line is itself a write).
++  static std::atomic<uint32_t> count{0};
++  const uint32_t n = count.fetch_add(1, std::memory_order_relaxed) + 1;
++  if (n <= 40 || n % 50 == 0) {
++    REXLOG_INFO("[diag] slow file call #{}: {} {} ({} bytes) took {:.1f} ms", n, what, path, bytes,
++                double(ns) / 1e6);
++  }
++}
++
+ XFile::XFile(KernelState* kernel_state, rex::filesystem::File* file, bool synchronous)
+     : XObject(kernel_state, kObjectType), file_(file), is_synchronous_(synchronous) {
+   async_event_ = rex::thread::Event::CreateAutoResetEvent(false);
+@@ -105,8 +129,11 @@ X_STATUS XFile::QueryDirectory(X_FILE_DIRECTORY_INFORMATION* out_info, size_t le
+ X_STATUS XFile::Read(uint32_t buffer_guest_address, uint32_t buffer_length, uint64_t byte_offset,
+                      uint32_t* out_bytes_read, uint32_t apc_context, bool notify_completion) {
+   std::lock_guard<std::mutex> lock(file_lock_);
+-  return ReadInternal(buffer_guest_address, buffer_length, byte_offset, out_bytes_read, apc_context,
+-                      notify_completion);
++  const int64_t start_ns = SlowFileCallClock();
++  X_STATUS result = ReadInternal(buffer_guest_address, buffer_length, byte_offset, out_bytes_read,
++                                 apc_context, notify_completion);
++  NoteSlowFileCall("read", path(), buffer_length, start_ns);
++  return result;
+ }
+ 
+ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_length,
+@@ -211,32 +238,71 @@ X_STATUS XFile::ReadScatter(uint32_t segments_guest_address, uint32_t length, ui
+   // TODO: not sure if this is meant to change depending on buffer address?
+   // (only game seen using this always seems to use 4096-byte buffers)
+   uint32_t page_size = 4096;
++  const int64_t start_ns = SlowFileCallClock();
+ 
+   uint32_t read_total = 0;
+   uint32_t read_remain = length;
++  auto offset_after = [&](uint32_t done) -> uint64_t {
++    return byte_offset
++               ? ((byte_offset != -1 && byte_offset != -2) ? byte_offset + done : byte_offset)
++               : -1;
++  };
++  // [ng2 ps5 port] Segments that follow each other in guest memory (in the
++  // same heap) are read in one go, up to 64 pages: each ReadInternal is a host
++  // read plus, for physical memory, an invalidation under the global lock -
++  // which the GPU thread takes on almost every draw - and the game streams
++  // with these. A merged read that fails is redone page by page, so an error
++  // stops at the same page it always did.
++  constexpr uint32_t kMaxRunBytes = 64 * 4096;
+   while (read_remain) {
+-    uint32_t read_length = read_remain;
+-    uint32_t read_buffer = *segments;
+-    if (read_length > page_size) {
+-      read_length = page_size;
+-      segments++;
++    const uint32_t run_buffer = segments[0];
++    const rex::memory::BaseHeap* run_heap = memory()->LookupHeap(run_buffer);
++    uint32_t run_length = 0;
++    uint32_t run_segments = 0;
++    while (run_length < read_remain) {
++      const uint32_t segment_length = std::min(read_remain - run_length, page_size);
++      if (run_segments) {
++        const uint32_t segment_buffer = segments[run_segments];
++        if (segment_buffer != run_buffer + run_length || segment_buffer < run_buffer ||
++            run_length + segment_length > kMaxRunBytes ||
++            memory()->LookupHeap(segment_buffer) != run_heap) {
++          break;
++        }
++      }
++      run_length += segment_length;
++      ++run_segments;
+     }
+ 
+-    uint32_t bytes_read = 0;
+-    result = ReadInternal(
+-        read_buffer, read_length,
+-        byte_offset
+-            ? ((byte_offset != -1 && byte_offset != -2) ? byte_offset + read_total : byte_offset)
+-            : -1,
+-        &bytes_read, apc_context, false);
++    if (run_segments > 1) {
++      uint32_t bytes_read = 0;
++      result = ReadInternal(run_buffer, run_length, offset_after(read_total), &bytes_read,
++                            apc_context, false);
++      if (result == X_STATUS_SUCCESS) {
++        read_total += bytes_read;
++        read_remain -= run_length;
++        segments += run_segments;
++        continue;
++      }
++    }
+ 
++    // One page at a time (a single page, or a merged read that failed).
++    for (uint32_t i = 0; i < run_segments; ++i) {
++      const uint32_t read_length = std::min(read_remain, page_size);
++      uint32_t bytes_read = 0;
++      result = ReadInternal(segments[0], read_length, offset_after(read_total), &bytes_read,
++                            apc_context, false);
++      if (result != X_STATUS_SUCCESS) {
++        break;
++      }
++      read_total += bytes_read;
++      read_remain -= read_length;
++      ++segments;
++    }
+     if (result != X_STATUS_SUCCESS) {
+       break;
+     }
+-
+-    read_total += bytes_read;
+-    read_remain -= read_length;
+   }
++  NoteSlowFileCall("scatter read", path(), length, start_ns);
+ 
+   if (out_bytes_read) {
+     *out_bytes_read = uint32_t(read_total);
+@@ -263,9 +329,11 @@ X_STATUS XFile::Write(uint32_t buffer_guest_address, uint32_t buffer_length, uin
+   }
+ 
+   size_t bytes_written = 0;
++  const int64_t start_ns = SlowFileCallClock();
+   X_STATUS result = file_->WriteSync(
+       std::span<const uint8_t>(memory()->TranslateVirtual(buffer_guest_address), buffer_length),
+       size_t(byte_offset), &bytes_written);
++  NoteSlowFileCall("write", path(), buffer_length, start_ns);
+   if (XSUCCEEDED(result)) {
+     position_ += bytes_written;
+   }
+@@ -287,7 +355,10 @@ X_STATUS XFile::Write(uint32_t buffer_guest_address, uint32_t buffer_length, uin
+ 
+ X_STATUS XFile::SetLength(size_t length) {
+   std::lock_guard<std::mutex> lock(file_lock_);
+-  return file_->SetLength(length);
++  const int64_t start_ns = SlowFileCallClock();
++  X_STATUS result = file_->SetLength(length);
++  NoteSlowFileCall("set length", path(), length, start_ns);
++  return result;
+ }
+ 
+ X_STATUS XFile::Rename(const std::filesystem::path& file_path) {
 diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
 index 7a3cd053..41174dfd 100644
 --- a/src/system/xmemory.cpp
@@ -1770,20 +3240,116 @@ index b4e045f3..8ad4df42 100644
                        "Common resolution preset for both guest video mode and startup window (for "
                        "example: 720p, 1080p, 1440p, 4k, 1280x720)")
 diff --git a/src/ui/windowed_app_main_sdl.cpp b/src/ui/windowed_app_main_sdl.cpp
-index 4f7b3948..d1db88c3 100644
+index 4f7b3948..b9aec103 100644
 --- a/src/ui/windowed_app_main_sdl.cpp
 +++ b/src/ui/windowed_app_main_sdl.cpp
-@@ -208,13 +208,26 @@ static void Ps5DiagMonitor() {
+@@ -197,84 +197,174 @@ static void Ps5Terminate() {
+ #include <spdlog/spdlog.h>
+ #include <chrono>
+ #include <thread>
++// [ng2 ps5 port] While on, every 10 s tick profiles the GPU command thread
++// for 8 s (rex::ps5diag::ProfileThread): where its CPU time goes, without the
++// per-draw clock reads that make the GPU timing details too costly to use.
++REXCVAR_DEFINE_BOOL(gpu_profile_command_thread, false, "GPU",
++                    "[ng2 ps5 port] Sample the GPU command thread (1 kHz) and log where it spends its time")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++// Which thread the profile samples, by name: "GPU Commands" (default), or
++// "Main XThread", the game's own main loop.
++REXCVAR_DEFINE_STRING(gpu_profile_thread_name, "GPU Commands", "GPU",
++                      "[ng2 ps5 port] The thread gpu_profile_command_thread samples (a name, or part of one)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ static void Ps5DiagMonitor() {
+   using namespace rex::ps5diag;
++  const auto monitor_start = std::chrono::steady_clock::now();
+   for (int tick = 1;; ++tick) {
+-    std::this_thread::sleep_for(std::chrono::seconds(10));
++    // [ng2 ps5 port] The 8 s profile is part of the 10 s tick, not added to
++    // it (it made every tick ~18 s while the line still said 10), and the
++    // line gives the real time since the monitor started.
++    if (REXCVAR_GET(gpu_profile_command_thread)) {
++      std::this_thread::sleep_for(std::chrono::seconds(2));
++      ProfileThread(REXCVAR_GET(gpu_profile_thread_name).c_str(), 8);
++    } else {
++      std::this_thread::sleep_for(std::chrono::seconds(10));
++    }
++    const long long elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(
++                                    std::chrono::steady_clock::now() - monitor_start)
++                                    .count();
+     REXLOG_INFO(
+         "ps5 diag {}s: faults {} (mmio {}, watch {}, unhandled {}), vblanks {}, interrupts {}, "
+-        "ring writes {}, ring batches {}",
+-        tick * 10, counters[kAccessViolations].load(), counters[kMmioAccesses].load(),
++        "ring writes {}, ring batches {}, mprotect calls {} ({} pages), refresh hashed {} pages "
++        "in {} calls ({} unchanged; {} pages in {} calls of 64+)",
++        elapsed_s, counters[kAccessViolations].load(), counters[kMmioAccesses].load(),
          counters[kWatchFaults].load(), counters[kUnhandledFaults].load(), counters[kVblanks].load(),
          counters[kInterrupts].load(), counters[kWritePointer].load(),
-         counters[kPrimaryBuffers].load());
+-        counters[kPrimaryBuffers].load());
 -    // Guest threads stuck in one kernel wait for over 5 s.
++        counters[kPrimaryBuffers].load(), counters[kProtectCalls].load(), counters[kProtectPages].load(),
++        counters[kRefreshHashPages].load(), counters[kRefreshHashCalls].load(),
++        counters[kRefreshSkipPages].load(), counters[kRefreshBigPages].load(),
++        counters[kRefreshBigCalls].load());
 +    // Guest threads stuck in one kernel wait. [ng2 X4] Each wait is reported
 +    // once when it passes 30 s and once more at 300 s, not on every tick past
 +    // 5 s: a healthy title screen has waits that long (the PC port measured
 +    // thirteen warnings a minute at 10 s). Every wait entry point and contended
 +    // critical sections fill these slots, so all of them are covered. The 300 s
 +    // line is a fact, not a verdict: read it next to the vblank counter above.
++    // One wait's report: the thread, what it waits on, the game code that
++    // called it, and a critical section's state. Used at 30 s and 300 s, and
++    // for every wait when the game stalls (below).
++    auto report_wait = [&](int slot, uint64_t waited, const char* note) {
++      WaitSlot& w = wait_slots[slot];
++      REXLOG_WARN("ps5 diag:   guest thread {:X} waiting {}s{} on {} {} handle {:08X}{} from game code {:08X}",
++                  w.thread_id, waited / 1000, note, w.count > 1 ? w.count : 1,
++                  ObjectTypeName(w.object_type), w.handle, w.count > 1 ? " (first of several)" : "",
++                  w.guest_lr);
++      // its callers: each frame's back chain at 0(r1), the caller's LR
++      // saved at -8 from the caller's frame (mflr r12; stw r12,-8(r1);
++      // stwu ...) - read only where the guest memory is committed
++      if (auto* kernel = rex::system::kernel_state(); kernel && w.guest_sp && w.guest_stack_lo) {
++        auto* memory = kernel->memory();
++        auto readable = [&](uint32_t a) {
++          uint32_t protect = 0;
++          auto* heap = memory->LookupHeap(a);
++          return heap && heap->QueryProtect(a, &protect) && (protect & rex::memory::kMemoryProtectRead);
++        };
++        std::string callers;
++        uint32_t sp = w.guest_sp;
++        for (int i = 0; i < 8; ++i) {
++          if (sp < w.guest_stack_lo || sp + 4 > w.guest_stack_hi || (sp & 3) || !readable(sp)) break;
++          const uint32_t back = rex::memory::load_and_swap<uint32_t>(memory->TranslateVirtual(sp));
++          if (back <= sp || back < w.guest_stack_lo + 8 || back > w.guest_stack_hi || !readable(back - 8)) break;
++          callers += fmt::format(" < {:08X}",
++                                 rex::memory::load_and_swap<uint32_t>(memory->TranslateVirtual(back - 8)));
++          sp = back;
++        }
++        if (!callers.empty()) REXLOG_INFO("ps5 diag:     called from{}", callers);
++      }
++      if (const auto* cs = static_cast<const uint8_t*>(w.critical_section)) {
++        auto be32 = [cs](int off) {
++          return uint32_t(cs[off]) << 24 | uint32_t(cs[off + 1]) << 16 |
++                 uint32_t(cs[off + 2]) << 8 | uint32_t(cs[off + 3]);
++        };
++        auto le32 = [cs](int off) {
++          return uint32_t(cs[off]) | uint32_t(cs[off + 1]) << 8 | uint32_t(cs[off + 2]) << 16 |
++                 uint32_t(cs[off + 3]) << 24;
++        };
++        std::string raw;
++        for (int b = 0; b < 28; ++b) raw += fmt::format("{:02X}{}", cs[b], b % 4 == 3 ? " " : "");
++        REXLOG_INFO("ps5 diag:     critical section {:08X} entered from {:08X}: lock count {}, recursion {}, "
++                    "held by kthread {:08X}; initialized {}; bytes {}",
++                    w.critical_section_guest, w.critical_section_lr, int32_t(le32(0x10)),
++                    int32_t(be32(0x14)), be32(0x18),
++                    CriticalSectionInitBy(w.critical_section_guest)
++                        ? fmt::format("by game code {:08X}", CriticalSectionInitBy(w.critical_section_guest))
++                        : std::string("never (by RtlInitializeCriticalSection)"),
++                    raw);
++      }
++    };
 +    static uint64_t reported_30[kWaitSlots] = {}, reported_300[kWaitSlots] = {};
      const uint64_t now = NowMs();
 -    for (WaitSlot& w : wait_slots) {
@@ -1793,6 +3359,50 @@ index 4f7b3948..d1db88c3 100644
 -      if (since && since < now && now - since > 5000) {
 -        REXLOG_INFO("ps5 diag:   guest thread {:X} waiting {}s on {} {} handle {:08X}{} from game code {:08X}",
 -                    w.thread_id, (now - since) / 1000, w.count > 1 ? w.count : 1,
+-                    ObjectTypeName(w.object_type), w.handle, w.count > 1 ? " (first of several)" : "",
+-                    w.guest_lr);
+-        // its callers: each frame's back chain at 0(r1), the caller's LR
+-        // saved at -8 from the caller's frame (mflr r12; stw r12,-8(r1);
+-        // stwu ...) - read only where the guest memory is committed
+-        if (auto* kernel = rex::system::kernel_state(); kernel && w.guest_sp && w.guest_stack_lo) {
+-          auto* memory = kernel->memory();
+-          auto readable = [&](uint32_t a) {
+-            uint32_t protect = 0;
+-            auto* heap = memory->LookupHeap(a);
+-            return heap && heap->QueryProtect(a, &protect) && (protect & rex::memory::kMemoryProtectRead);
+-          };
+-          std::string callers;
+-          uint32_t sp = w.guest_sp;
+-          for (int i = 0; i < 8; ++i) {
+-            if (sp < w.guest_stack_lo || sp + 4 > w.guest_stack_hi || (sp & 3) || !readable(sp)) break;
+-            const uint32_t back = rex::memory::load_and_swap<uint32_t>(memory->TranslateVirtual(sp));
+-            if (back <= sp || back < w.guest_stack_lo + 8 || back > w.guest_stack_hi || !readable(back - 8)) break;
+-            callers += fmt::format(" < {:08X}",
+-                                   rex::memory::load_and_swap<uint32_t>(memory->TranslateVirtual(back - 8)));
+-            sp = back;
+-          }
+-          if (!callers.empty()) REXLOG_INFO("ps5 diag:     called from{}", callers);
+-        }
+-        if (const auto* cs = static_cast<const uint8_t*>(w.critical_section)) {
+-          auto be32 = [cs](int off) {
+-            return uint32_t(cs[off]) << 24 | uint32_t(cs[off + 1]) << 16 |
+-                   uint32_t(cs[off + 2]) << 8 | uint32_t(cs[off + 3]);
+-          };
+-          auto le32 = [cs](int off) {
+-            return uint32_t(cs[off]) | uint32_t(cs[off + 1]) << 8 | uint32_t(cs[off + 2]) << 16 |
+-                   uint32_t(cs[off + 3]) << 24;
+-          };
+-          std::string raw;
+-          for (int b = 0; b < 28; ++b) raw += fmt::format("{:02X}{}", cs[b], b % 4 == 3 ? " " : "");
+-          REXLOG_INFO("ps5 diag:     critical section {:08X} entered from {:08X}: lock count {}, recursion {}, "
+-                      "held by kthread {:08X}; initialized {}; bytes {}",
+-                      w.critical_section_guest, w.critical_section_lr, int32_t(le32(0x10)),
+-                      int32_t(be32(0x14)), be32(0x18),
+-                      CriticalSectionInitBy(w.critical_section_guest)
+-                          ? fmt::format("by game code {:08X}", CriticalSectionInitBy(w.critical_section_guest))
+-                          : std::string("never (by RtlInitializeCriticalSection)"),
+-                      raw);
+-        }
 +      if (!since || since >= now) continue;
 +      const uint64_t waited = now - since;
 +      const bool at_30 = waited > 30000 && reported_30[slot] != since;
@@ -1800,12 +3410,38 @@ index 4f7b3948..d1db88c3 100644
 +      if (at_30 || at_300) {
 +        reported_30[slot] = since;
 +        if (at_300) reported_300[slot] = since;
-+        REXLOG_WARN("ps5 diag:   guest thread {:X} waiting {}s{} on {} {} handle {:08X}{} from game code {:08X}",
-+                    w.thread_id, waited / 1000, at_300 ? " (final report)" : "", w.count > 1 ? w.count : 1,
-                     ObjectTypeName(w.object_type), w.handle, w.count > 1 ? " (first of several)" : "",
-                     w.guest_lr);
-         // its callers: each frame's back chain at 0(r1), the caller's LR
-@@ -273,8 +286,31 @@ static void Ps5DiagMonitor() {
++        report_wait(slot, waited, at_300 ? " (final report)" : "");
+       }
+     }
+-    // The game stopped submitting GPU work: show where every thread is, twice.
++    // The game stalled: it stopped submitting GPU work, or its batches fell
++    // below a fifth of the previous 10 s while the display kept running (a
++    // freeze in v0.1.1 went from ~600 to 62 - never zero, so waiting for zero
++    // reported nothing). [ng2 ps5 port] Report it at the first tick: every
++    // guest thread waiting more than 2 s, and where every host thread is.
++    // Three reports a run at most.
+     static uint64_t last_writes = 0, stuck_ticks = 0, samples = 0;
++    static uint64_t last_batches = 0, last_batch_delta = 0;
+     uint64_t writes = counters[kWritePointer].load();
+     stuck_ticks = writes == last_writes ? stuck_ticks + 1 : 0;
+     last_writes = writes;
+-    if ((stuck_ticks == 3 || stuck_ticks == 6) && samples < 2) {
++    const uint64_t batches = counters[kPrimaryBuffers].load();
++    const uint64_t batch_delta = batches - last_batches;
++    last_batches = batches;
++    const bool sudden_drop = last_batch_delta >= 200 && batch_delta * 5 < last_batch_delta;
++    if (writes > 0 && (sudden_drop || stuck_ticks == 1) && samples < 3) {  // (writes > 0: the game has started)
+       ++samples;
++      REXLOG_WARN("ps5 diag: the game stalled - GPU batches {} in the last 10 s (before: {}); every guest thread "
++                  "waiting over 2 s, then every host thread:",
++                  batch_delta, last_batch_delta);
++      for (int slot = 0; slot < kWaitSlots; ++slot) {
++        const uint64_t since = wait_slots[slot].since_ms.load(std::memory_order_acquire);
++        if (since && since < now && now - since > 2000) report_wait(slot, now - since, " (stall)");
++      }
+       SampleAllThreads();
+     }
++    last_batch_delta = batch_delta;
    }
  }
  

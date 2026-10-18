@@ -1,5 +1,52 @@
 # Release notes
 
+## v0.1.2.1-alpha - performance
+
+The biggest performance update so far. In the heaviest fights tested, the worst
+moments went from the mid-40s to the mid-50s fps, and most of the time the game
+holds 60. (v0.1.2 was never published; this is it, with the lock change below.)
+
+- **Less waiting on the runtime's global lock.** In heavy scenes the GPU
+  thread spent up to a fifth of its time asleep waiting for one lock that the
+  game's threads take very often, mostly for a few microseconds at a time. On
+  PS5 a thread that finds that lock taken went straight to sleep in the
+  system; it now retries for about 20 microseconds first. The GPU thread also
+  checks larger blocks of memory for changes without holding the lock.
+
+- **Faster game code.** The recompiler used to make the game re-read its own
+  local variables from memory every time it touched them. It now lets the
+  compiler keep them in the processor's registers: about 1.2 million places in
+  the game's code, and the program came out 2.7% smaller.
+- **Asynchronous submission, now on by default.** The GPU thread hands most of
+  each frame's work to a second thread instead of sending it itself.
+- **Less memory-protection work.** The game's memory is watched for changes in
+  pieces that were four times larger on PS5 than intended (the PS5 uses 16 KB
+  memory pages, the PC 4 KB); now they are the intended size. About a third
+  fewer protection calls in heavy scenes.
+- **Skip unchanged memory.** The game needs its graphics memory refreshed every
+  frame (character animation is written where nothing else notices it); memory
+  that has not changed is now recognised and not re-sent. Animation is
+  unaffected.
+- **Smoother streaming.** The game's streaming reads were done 4 KB at a time,
+  each one taking a lock the GPU thread needs on almost every draw; adjacent
+  pieces are now read in one go.
+- **Fewer things hashed on the GPU thread:** only the button-prompt textures
+  are checked for replacements unless you use the texture dump or replacements.
+- **Input latency stays Standard by default.** Low (two screen images instead of
+  three) shows each frame about 16 ms sooner but made timing uneven in heavy
+  scenes; it is still in Performance > Input latency.
+- **For bug reports:** the logs now name slow file reads and writes, the stall
+  report shows what every thread was waiting on when the game stops, and
+  Developer > Profile thread can sample the GPU thread or the game's main
+  thread (`ps5/tools/symbolize_profile.py` reads the result).
+
+New hub settings (Performance tab): Memory refresh, Skip unchanged memory, Fast
+memory checks, Async submission, Descriptor reuse (experimental). The defaults
+are the tested ones; your other settings are kept.
+
+Updating from v0.1.1: copy the new `eboot.bin` and `sce_sys/` over the old
+ones; keep `Game Data/` and `UserData/`.
+
 ## v0.1.1-alpha - hotfix
 
 - **Fixed: opening a chest (or anything that shows a tutorial video - a new

@@ -116,7 +116,7 @@ const std::vector<Setting>& Settings();
 void ApplyPs5Defaults(Ng2Settings& s);
 // The defaults round this build applies; UpdatePs5Defaults brings an older
 // settings file up to it (first run: all of ApplyPs5Defaults).
-constexpr int kPs5DefaultsVersion = 3;
+constexpr int kPs5DefaultsVersion = 6;
 void UpdatePs5Defaults(Ng2Settings& s);
 // Every row back to its default, then the PS5's.
 void ResetAll(Ng2Settings& s);

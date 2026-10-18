@@ -169,6 +169,20 @@ struct Ng2Tuning {
     // cheaper per pixel, less exact (docs/PS5_PORT.md 3.5).
     out.push_back({"guest_vblank_display_locked", s.ps5_display_locked_vblank ? "true" : "false",
                    "[ps5] frame pacing: guest vblanks on the display's refresh"});
+    out.push_back({"shared_memory_verify_refresh", s.ps5_verify_refresh ? "true" : "false",
+                   "[ps5] after the memory refresh, re-upload only pages that changed"});
+    out.push_back({"shared_memory_valid_check_before_lock", s.ps5_fast_memory_checks ? "true" : "false",
+                   "[ps5] check for valid memory before the global lock"});
+    out.push_back({"clear_memory_page_state_interval", std::to_string(std::clamp(s.ps5_memory_refresh, 1, 4)),
+                   "[ps5] the memory refresh every N frames"});
+    out.push_back({"gpu_profile_thread_name", s.ps5_profile_target == 1 ? "Main XThread" : "GPU Commands",
+                   "[ps5] which thread the profile samples"});
+    out.push_back({"gpu_profile_command_thread", s.ps5_profile_gpu ? "true" : "false",
+                   "[ps5] diagnostics: sample the GPU command thread"});
+    out.push_back({"vulkan_async_submission", s.ps5_async_submission ? "true" : "false",
+                   "[ps5] experimental: submit on a worker thread"});
+    out.push_back({"vulkan_texture_descriptor_reuse", s.ps5_descriptor_reuse ? "true" : "false",
+                   "[ps5] experimental: reuse unchanged texture descriptor sets"});
     out.push_back({"gpu_phase_timer_details", s.ps5_gpu_timer_details ? "true" : "false",
                    "[ps5] diagnostics: time the parts of every draw"});
     out.push_back({"present_low_latency", s.ps5_low_latency ? "true" : "false",

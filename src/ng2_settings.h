@@ -315,10 +315,31 @@ struct Ng2Settings {
   bool ps5_remove_screen_flash = false;  // (coming soon: not applied yet)
   // Two swapchain images instead of three: about a refresh (16 ms) less input
   // latency; Standard (three, as before) gives a late paint more slack and is
-  // the default until Low is shown not to cost smoothness.
+  // the default: Low made timing feel uneven in 16.13 testing.
   bool ps5_low_latency = false;
   // Diagnostics: time the parts of every draw (costs frame rate).
   bool ps5_gpu_timer_details = false;
+  // Experimental: reuse the previous draw's texture descriptor set when
+  // nothing changed (less CPU per draw in heavy scenes).
+  bool ps5_descriptor_reuse = false;
+  // Diagnostics: sample the GPU command thread and log where it spends time.
+  bool ps5_profile_gpu = false;
+  // How often NG2's required memory refresh (clear_memory_page_state) runs:
+  // every frame (1, as the game is known to need) or every 2nd / 4th frame -
+  // each refresh makes the next frame re-upload every vertex and index
+  // buffer in use.
+  int ps5_memory_refresh = 1;
+  // Check that the memory a draw needs is already on the GPU before taking
+  // the runtime's global lock (shared_memory_valid_check_before_lock).
+  bool ps5_fast_memory_checks = true;
+  // After the per-frame memory refresh, re-upload only pages whose content
+  // changed (shared_memory_verify_refresh).
+  bool ps5_verify_refresh = true;
+  // What Profile GPU thread samples: 0 the GPU command thread, 1 the game's
+  // main thread.
+  int ps5_profile_target = 0;
+  // Experimental: replay and submit command buffers on a worker thread.
+  bool ps5_async_submission = true;
   // Developer, diagnostic: capture a frame report this many seconds after
   // the first frame (0 off) - every rendered image of two frames, written to
   // logs/frame_reports - not saved on.
@@ -483,6 +504,13 @@ struct Ng2Settings {
         << "ps5_remove_screen_flash=" << (ps5_remove_screen_flash ? 1 : 0) << "\n"
         << "ps5_low_latency=" << (ps5_low_latency ? 1 : 0) << "\n"
         << "ps5_gpu_timer_details=" << (ps5_gpu_timer_details ? 1 : 0) << "\n"
+        << "ps5_descriptor_reuse=" << (ps5_descriptor_reuse ? 1 : 0) << "\n"
+        << "ps5_profile_gpu=" << (ps5_profile_gpu ? 1 : 0) << "\n"
+        << "ps5_memory_refresh=" << ps5_memory_refresh << "\n"
+        << "ps5_fast_memory_checks=" << (ps5_fast_memory_checks ? 1 : 0) << "\n"
+        << "ps5_verify_refresh=" << (ps5_verify_refresh ? 1 : 0) << "\n"
+        << "ps5_profile_target=" << ps5_profile_target << "\n"
+        << "ps5_async_submission=" << (ps5_async_submission ? 1 : 0) << "\n"
 
         << "ps5_menu_music=" << (ps5_menu_music ? 1 : 0) << "\n"
         << "ps5_defaults_applied=" << (ps5_defaults_applied ? 1 : 0) << "\n"
@@ -601,6 +629,13 @@ struct Ng2Settings {
     else if (k == "ps5_remove_screen_flash") ps5_remove_screen_flash = Truthy(v);
     else if (k == "ps5_low_latency") ps5_low_latency = Truthy(v);
     else if (k == "ps5_gpu_timer_details") ps5_gpu_timer_details = Truthy(v);
+    else if (k == "ps5_descriptor_reuse") ps5_descriptor_reuse = Truthy(v);
+    else if (k == "ps5_profile_gpu") ps5_profile_gpu = Truthy(v);
+    else if (k == "ps5_memory_refresh") ps5_memory_refresh = std::clamp(std::atoi(v.c_str()), 1, 4);
+    else if (k == "ps5_fast_memory_checks") ps5_fast_memory_checks = Truthy(v);
+    else if (k == "ps5_verify_refresh") ps5_verify_refresh = Truthy(v);
+    else if (k == "ps5_profile_target") ps5_profile_target = std::clamp(std::atoi(v.c_str()), 0, 1);
+    else if (k == "ps5_async_submission") ps5_async_submission = Truthy(v);
 
     else if (k == "ps5_menu_music") ps5_menu_music = Truthy(v);
     else if (k == "ps5_defaults_applied") ps5_defaults_applied = Truthy(v);

@@ -45,6 +45,11 @@ bool Considered(const rex::graphics::GuestTextureLoad& t) {
 std::mutex g_mutex;
 fs::path g_dir;
 std::set<uint64_t> g_available;                                // hashes with a file
+// Whether any replacement may be in a format other than k_8: a .dds or .bin
+// file (a .rect patches k_8 index pictures only). Without one, and with the
+// HUD dump off, only k_8 loads are hashed - the GPU thread's profile had this
+// hook at ~8% of its time in heavy scenes, hashing every small DXT texture.
+bool g_other_formats = false;
 std::map<uint64_t, std::optional<std::vector<uint8_t>>> g_converted;  // per hash, once
 std::set<uint64_t> g_dumped;
 // Distinct pictures dumped per guest address: an address whose picture keeps
@@ -236,6 +241,7 @@ void Init(const fs::path& app) {
   g_dir = app / "hub" / "button_prompts" / "playstation";
   g_available.clear();
   g_converted.clear();
+  g_other_formats = false;
   std::error_code ec;
   for (fs::directory_iterator it(g_dir, ec), end; !ec && it != end; it.increment(ec)) {
     const auto stem = it->path().stem().string();
@@ -243,6 +249,8 @@ void Init(const fs::path& app) {
     if (stem.size() != 16 || (ext != ".dds" && ext != ".bin" && ext != ".rect"))
       continue;
     g_available.insert(std::strtoull(stem.c_str(), nullptr, 16));
+    if (ext != ".rect")
+      g_other_formats = true;
   }
   REXLOG_INFO("PS5 prompts: {} PlayStation picture(s) in {}", g_available.size(), g_dir.string());
 }
@@ -273,6 +281,8 @@ static bool IsVideo(uint32_t address) {
 }
 
 void OnTextureLoad(const rex::graphics::GuestTextureLoad& t, uint8_t* guest, bool replace, bool dump) {
+  if (!dump && (!replace || (t.format != 2 && !g_other_formats)))
+    return;
   if (!Considered(t) || !Block(t.format).bytes)
     return;
   if (t.format == 2 && IsVideo(t.base_address))

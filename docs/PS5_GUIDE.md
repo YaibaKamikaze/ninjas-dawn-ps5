@@ -100,9 +100,14 @@ but drops below 60 fps in heavy scenes; FBO is faster but hitches more.
 | Performance | Texture cache size | Memory for the game's textures. |
 | Performance | Performance readouts | Frame rate and CPU in a corner. |
 | Performance | Frame pacing | Display refresh (default) or the runtime's timer. |
-| Performance | Input latency | Standard (default) or Low: Low shows each frame about 16 ms sooner, with less slack for a late frame. |
+| Performance | Input latency | Standard (default) or Low: Low shows each frame about 16 ms sooner, but a frame that runs late is then shown a refresh later, so timing can feel uneven in heavy scenes. |
+| Performance | Memory refresh | How often the GPU's copy of the game's memory is refreshed. Keep **Every frame**: less often is faster but makes character animation twitch. |
+| Performance | Skip unchanged memory | On (default): memory that has not changed since the last refresh is not sent again. |
+| Performance | Fast memory checks | On (default): a quicker check before taking the memory lock. |
+| Performance | Async submission | On (default): most of each frame's GPU work is sent from a second thread. |
+| Performance | Descriptor reuse (experimental) | Off by default; reuses texture bindings between draws. |
 | Performance | Render target path | FSI (default, exact and stable) or FBO (experimental, faster, hitches more). |
-| Developer | Dump HUD pictures, GPU timing details, Frame report | Diagnostics for bug reports. |
+| Developer | Dump HUD pictures, GPU timing details, Profile GPU thread / Profile thread, Frame report | Diagnostics for bug reports (the profile costs a little frame rate while on). |
 
 ## 4. In the game
 

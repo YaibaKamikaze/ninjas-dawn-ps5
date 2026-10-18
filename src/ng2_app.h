@@ -423,6 +423,14 @@ class Ng2App : public rex::ReXApp {
         rex::cvar::SetFlagByName("guest_vblank_display_locked",
                                  settings_.ps5_display_locked_vblank ? "true" : "false");
         rex::cvar::SetFlagByName("gpu_phase_timer_details", settings_.ps5_gpu_timer_details ? "true" : "false");
+        rex::cvar::SetFlagByName("vulkan_texture_descriptor_reuse", settings_.ps5_descriptor_reuse ? "true" : "false");
+        rex::cvar::SetFlagByName("vulkan_async_submission", settings_.ps5_async_submission ? "true" : "false");
+        rex::cvar::SetFlagByName("gpu_profile_command_thread", settings_.ps5_profile_gpu ? "true" : "false");
+        rex::cvar::SetFlagByName("gpu_profile_thread_name",
+                                 settings_.ps5_profile_target == 1 ? "Main XThread" : "GPU Commands");
+        rex::cvar::SetFlagByName("clear_memory_page_state_interval", std::to_string(settings_.ps5_memory_refresh));
+        rex::cvar::SetFlagByName("shared_memory_valid_check_before_lock", settings_.ps5_fast_memory_checks ? "true" : "false");
+        rex::cvar::SetFlagByName("shared_memory_verify_refresh", settings_.ps5_verify_refresh ? "true" : "false");
       };
       callbacks.return_to_hub = [this] {
         app_context().CallInUIThreadDeferred([this] { ReturnToMenu(); });
