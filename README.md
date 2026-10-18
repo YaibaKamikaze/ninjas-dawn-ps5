@@ -1,4 +1,21 @@
 # Ninja's Dawn for PS5 (alpha)
+
+> [!IMPORTANT]
+> **Fully AI-coded project.** All of the code, tools and documentation in this
+> repository were written by an AI coding agent (Anthropic's Claude, through
+> Claude Code), directed by the maintainer, who also tested the results on a PS5.
+> Treat it like any other early-stage community project: expect bugs, read the
+> code before relying on it, and report problems via issues.
+> A **human-made Ninja Gaiden II recompilation** is currently in development by
+> [mystixor](https://github.com/mystixor) (no repository yet; follow progress on
+> [YouTube](https://www.youtube.com/@Mystixor)).
+> [Ninja's Dawn](https://github.com/FermataRest/Ninja-s-Dawn-A-Ninja-Gaiden-2-Recompilation-Project),
+> the PC recompilation this port is based on, is no longer being developed, and it
+> was never a great recompilation to begin with: it had bugs and parts of it were
+> broken.
+> No game data is included. You need your own legally obtained copy of
+> *Ninja Gaiden II* for Xbox 360.
+
 <img width="512" height="512" alt="icon0" src="https://github.com/user-attachments/assets/013fdf97-cb38-47ed-a035-aa53e4dd2761" />
 
 
